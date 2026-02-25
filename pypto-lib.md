@@ -502,3 +502,62 @@ This keeps the expansion predictable and the fusion pass simple: only a small, f
 **Incore scope** (Section 4): The user inserts an **incore scope directive** in Python source to mark the boundary between orchestration and incore compute. The scope defines an **anonymous incore function** (no explicit args) and a **call** at that location. The compiler derives **input** (outside, read-only inside), **inout** (outside, modified inside), and **output** (defined outside, unassigned by parent, written inside scope, read by parent after; passed by reference; memory allocated by runtime when incore is called/submitted), and generates a readable name (parent name as prefix) and explicit parameters/call site.
 
 This document describes the **method** of building that library; concrete primitive lists, build scripts, fusion-pass design, and incore-scope implementation can be added in the same folder as the library is implemented.
+
+---
+
+## 10. In-cluster-function-group
+
+This section describes front-end language features for expressing computation that runs on a **cluster** of locally interconnected cores, with in-cluster communication expressed as push/pop instead of store/load.
+
+### 10.1 Cluster as a dummy tensor
+
+A **cluster** is represented as a dummy tensor (or scalar variable) that corresponds to a cluster of locally interconnected cores. On **A5 Ascend** processors, one cluster consists of **2 AIV** and **1 AIC** cores. The cluster is the unit of allocation and scheduling for in-cluster function groups.
+
+### 10.2 In-cluster functions and communication
+
+**In-cluster functions** are a group of functions that communicate with each other using **local interconnect channels**, abstracted as **push** and **pop** operations. Within this group, data communication is expressed as **TPUSH** and **TPOP** operations inside incore functions, instead of **TSTORE** and **TLOAD**. This reflects the fact that data stays on the cluster’s local interconnect rather than going through global memory.
+
+### 10.3 Scope grammar: allocate_cluster
+
+The scope within which all incore functions are treated as one **in-cluster function group** is started by a **blocking** call to the pto runtime:
+
+- **`allocate_cluster`**  
+  The pto runtime is called to allocate an available processor cluster. It returns a dummy tensor or a scalar variable **`clusterID`** that identifies the allocated cluster.
+
+- **Blocking semantics**  
+  If no free cluster is available, the pto runtime **blocks** the orchestration until a free cluster becomes available. Only after `allocate_cluster` returns does the program proceed with the in-cluster function group.
+
+- **clusterID as input to the group**  
+  The **clusterID** is an **input argument** to all functions within this in-cluster function group. It is stored on the **pto runtime task descriptor** and indicates the **only valid cluster** on which a given task may execute.
+
+- **Scheduling guarantee**  
+  The pto-runtime scheduler **does not** schedule any task in this group to any other cluster; it always uses the cluster identified by **clusterID**. The scheduler still tracks **data dependencies** between tasks so that correctness and ordering are preserved.
+
+- **End of scope: free cluster**  
+  The program does **not** explicitly call a clusterID free API. When the **clusterID** tensor is freed by the runtime (e.g. when it goes out of scope or is deallocated), the **pto-runtime** automatically returns that cluster to the pool of available clusters so it can be allocated again by a subsequent `allocate_cluster` call.
+
+### 10.4 Incore argument types: PIPE_IN and PIPE_OUT
+
+The argument types of **incore functions** are extended to include **PIPE_IN** and **PIPE_OUT**. These denote variables that pass data using **local interconnect pipes**, instead of global-memory tensors.
+
+- **Semantics**  
+  **PIPE_IN** and **PIPE_OUT** represent producer–consumer data flow between functions in the in-cluster function group. Data is moved via the cluster’s local interconnect (TPUSH/TPOP), not via global memory.
+
+- **Runtime behavior**  
+  The **pto-runtime** does **not** allocate global memory (e.g. ring buffer) for PIPE_IN/PIPE_OUT arguments. They still express **data dependency** between functions, so the scheduler uses them to order tasks and ensure correct execution; only the storage is on the interconnect pipes, not in global memory.
+
+- **Drain invariant**  
+  The **programmer** must ensure that every in-cluster function group **completely drains** the interconnect pipe by the end of the scope. In other words: every **push** into the pipe must have a **corresponding pop** that removes that data. No data may remain in the pipe when the scope ends.
+
+- **Tensor map and minimum shape**  
+  For now, even though PIPE_IN and PIPE_OUT data pass through the pipes (not global memory), they can still be **treated as normal tensors of minimum shape** so that the **tensor map** can be used to track data dependency between functions.
+
+- **One producer, multiple consumers**  
+  If an incore function needs to pass data to **two** (or more) successor functions, it must be expressed as **two separate PIPE_OUT** variables at the function interface—one per consumer. Each PIPE_OUT corresponds to one logical pipe and one consumer.
+
+### 10.5 Summary
+
+- **Cluster**: dummy tensor/scalar representing a set of locally connected cores (e.g. 2 AIV + 1 AIC on A5 Ascend).
+- **In-cluster communication**: TPUSH/TPOP within incore functions, instead of TSTORE/TLOAD.
+- **Scope**: started by blocking **allocate_cluster**; **clusterID** is passed into every function in the group and recorded in the task descriptor so the runtime schedules those tasks only on that cluster while respecting data dependencies. The program does not explicitly free the cluster; the pto-runtime **automatically** frees it when the **clusterID** tensor is freed by the runtime.
+- **PIPE_IN / PIPE_OUT**: incore argument types for data passed over local interconnect pipes; no global memory allocation by the runtime; programmer must ensure the pipe is fully drained (every push has a matching pop). For dependency tracking they are treated as normal tensors of minimum shape in the tensor map; one producer feeding multiple consumers is expressed as multiple separate PIPE_OUT arguments.
