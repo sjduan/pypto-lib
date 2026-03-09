@@ -400,7 +400,7 @@ class Qwen3SingleLayerDecode:
                 exp_pad_0: pl.Tensor[[1, 60], pl.FP32, pl.MemRef(pl.MemorySpace.DDR, -1, 240, 40)] = pl.tensor.create([1, 60], dtype=pl.FP32)
                 exp_pad_1: pl.Tensor[[1, 120], pl.FP32, pl.MemRef(pl.MemorySpace.DDR, -1, 480, 42)] = pl.tensor.mul(exp_pad_0, 0.0)
             ctx_0: pl.Tensor[[1, 128], pl.FP32, pl.MemRef(pl.MemorySpace.DDR, -1, 512, 46)] = pl.tensor.row_expand_div(oi_3, li_3)
-            attn_row_4: pl.Tensor[[1, 5120], pl.FP32, pl.MemRef(pl.MemorySpace.DDR, -1, 20480, 47)] = pl.tensor.assemble(attn_row_iter_2_outer_l1, ctx_0, [0, q_col_0])
+            attn_row_4: pl.Tensor[[1, 5120], pl.FP32, pl.MemRef(pl.MemorySpace.DDR, -1, 20480, 47)] = pl.tensor.assemble(attn_row_iter_2_outer_l1, ctx_0, [0, q_col_0 + AIV_IDX * 64])
             attn_row_iter_2_outer_l1_rv, kvh_iter_1_outer_l1_rv = pl.yield_(attn_row_4, kvh_3)
         return attn_row_iter_2_outer_l1_rv, kvh_iter_1_outer_l1_rv
     @pl.function_group(aic="qwen3_decode_layer_incore_2_aic", aiv="qwen3_decode_layer_incore_2_aiv", aiv_runtime_params=["AIV_IDX"])

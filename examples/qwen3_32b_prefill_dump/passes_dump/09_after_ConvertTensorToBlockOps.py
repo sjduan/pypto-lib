@@ -355,7 +355,7 @@ class Qwen3SingleLayerPrefill:
                 _t23: pl.Tensor[[1, 128], pl.BFLOAT16] = pl.tensor.cast(k_rot_2, target_type=pl.BFLOAT16, mode=2)
                 k_cache_9: pl.Tensor[[524288, 128], pl.BFLOAT16] = pl.tensor.assemble(k_cache_iter_7_outer_l1, _t23, [cache_row_0, 0])
                 _t24: pl.Tensor[[1, 64], pl.BFLOAT16] = pl.tensor.view(v_proj_tile_iter_1_outer_l0_rv, [1, 64], [ti_0, kv_col_0 + AIV_IDX * 64])
-                v_cache_9: pl.Tensor[[524288, 128], pl.BFLOAT16] = pl.tensor.assemble(v_cache_iter_7_outer_l1, _t24, [cache_row_0 + AIV_IDX * 64, 0])
+                v_cache_9: pl.Tensor[[524288, 128], pl.BFLOAT16] = pl.tensor.assemble(v_cache_iter_7_outer_l1, _t24, [cache_row_0, 0 + AIV_IDX * 64])
                 k_cache_10, v_cache_10 = pl.yield_(k_cache_9, v_cache_9)
             else:
                 k_cache_10, v_cache_10 = pl.yield_(k_cache_iter_7_outer_l1, v_cache_iter_7_outer_l1)
@@ -391,7 +391,7 @@ class Qwen3SingleLayerPrefill:
                 exp_pad_0: pl.Tensor[[1, 60], pl.FP32] = pl.tensor.create([1, 60], dtype=pl.FP32)
                 exp_pad_1: pl.Tensor[[1, 120], pl.FP32] = pl.tensor.mul(exp_pad_0, 0.0)
             ctx_0: pl.Tensor[[1, 128], pl.FP32] = pl.tensor.row_expand_div(oi_3, li_3)
-            attn_row_4: pl.Tensor[[1, 5120], pl.FP32] = pl.tensor.assemble(attn_row_iter_2_outer_l1, ctx_0, [0, q_col_0])
+            attn_row_4: pl.Tensor[[1, 5120], pl.FP32] = pl.tensor.assemble(attn_row_iter_2_outer_l1, ctx_0, [0, q_col_0 + AIV_IDX * 64])
             attn_row_iter_2_outer_l1_rv, k_cache_iter_7_outer_l1_rv, v_cache_iter_7_outer_l1_rv = pl.yield_(attn_row_4, k_cache_10, v_cache_10)
         return attn_row_iter_2_outer_l1_rv, k_cache_iter_7_outer_l1_rv, v_cache_iter_7_outer_l1_rv
     @pl.function_group(aic="qwen3_prefill_layer_incore_2_aic", aiv="qwen3_prefill_layer_incore_2_aiv", aiv_runtime_params=["AIV_IDX"])
