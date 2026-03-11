@@ -20,7 +20,7 @@ Design goals:
 - per-session KV cache depth up to 4096
 - fewer, larger auto_incore scopes
 - fused outer loops where practical
-- all pl.view / pl.slice of GM tensors are >= 512 B (alignment rule)
+- all pl.slice / pl.slice of GM tensors are >= 512 B (alignment rule)
 """
 
 import os
