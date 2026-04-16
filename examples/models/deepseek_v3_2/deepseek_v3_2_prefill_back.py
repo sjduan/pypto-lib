@@ -67,7 +67,6 @@ def build_deepseek_v3_2_prefill_back_program(
             self,
             hidden_states: pl.Tensor[[BATCH_CFG, MAX_SEQ_CFG, HIDDEN_CFG], pl.BF16],
             seq_lens: pl.Tensor[[BATCH_CFG], pl.INT32],
-            node_id_t: pl.Tensor[[1], pl.INT32],
             combine_buf: pl.Tensor[[EP_NODES_CFG, BATCH_CFG, MAX_SEQ_CFG, ATTN_OUT_CFG], pl.BF16],
             wo: pl.Tensor[[ATTN_OUT_CFG, HIDDEN_CFG], pl.BF16],
             post_rms_weight: pl.Tensor[[1, HIDDEN_CFG], pl.FP32],
@@ -76,7 +75,6 @@ def build_deepseek_v3_2_prefill_back_program(
             w_down: pl.Tensor[[INTER_CFG, HIDDEN_CFG], pl.BF16],
             out: pl.Tensor[[BATCH_CFG, MAX_SEQ_CFG, HIDDEN_CFG], pl.BF16],
         ) -> pl.Tensor[[BATCH_CFG, MAX_SEQ_CFG, HIDDEN_CFG], pl.BF16]:
-            node_id = pl.tensor.read(node_id_t, [0])
             for b in pl.parallel(0, BATCH_CFG, 1):
                 seq_len_b = pl.tensor.read(seq_lens, [b])
                 tok_blocks = (seq_len_b + TOK_TILE - 1) // TOK_TILE
@@ -103,14 +101,7 @@ def build_deepseek_v3_2_prefill_back_program(
                             a_chunk_bf16 = pl.cast(a_chunk_fp32, target_type=pl.BF16)
                             attn_tile = pl.assemble(attn_tile, a_chunk_bf16, [0, k0])
 
-                    # Stage 2: Initialize resid1_tile accumulator to zero.
-                    with pl.auto_incore():
-                        for ob in pl.parallel(0, Q_OUT_BLOCKS, chunk=8):
-                            o0 = ob * Q_OUT_CHUNK
-                            zero_resid1 = pl.full([TOK_TILE, Q_OUT_CHUNK], dtype=pl.FP32, value=0.0)
-                            resid1_tile = pl.assemble(resid1_tile, zero_resid1, [0, o0])
-
-                    # Stage 3: Output projection + first residual.
+                    # Stage 2: Output projection + first residual.
                     for ob in pl.range(Q_OUT_BLOCKS):
                         o0 = ob * Q_OUT_CHUNK
 
@@ -141,9 +132,11 @@ def build_deepseek_v3_2_prefill_back_program(
                             resid_sum = pl.add(mm_out, resid_chunk)
                             resid1_tile = pl.assemble(resid1_tile, resid_sum, [0, o0])
 
-                    # Stage 4: Post-attention RMSNorm.
+                    # Stage 3: Post-attention RMSNorm.
                     post_norm_tile = pl.create_tensor([TOK_TILE, HIDDEN_CFG], dtype=pl.BF16)
                     down_fp32_tile = pl.create_tensor([TOK_TILE, HIDDEN_CFG], dtype=pl.FP32)
+
+                    # 3a: Compute inv_rms (reduction — sequential).
                     with pl.auto_incore():
                         sq_sum = pl.full([1, TOK_TILE], dtype=pl.FP32, value=0.0)
                         for kb in pl.range(HIDDEN_BLOCKS):
@@ -153,10 +146,11 @@ def build_deepseek_v3_2_prefill_back_program(
                                 sq_sum,
                                 pl.reshape(pl.row_sum(pl.mul(x_chunk, x_chunk)), [1, TOK_TILE]),
                             )
-                        inv_rms = pl.recip(pl.sqrt(pl.add(pl.mul(sq_sum, HIDDEN_INV), EPS)))
+                        inv_rms = pl.rsqrt(pl.add(pl.mul(sq_sum, HIDDEN_INV), EPS))
 
-                        # Normalize, apply gamma, zero-init down_proj accumulator.
-                        for kb in pl.range(HIDDEN_BLOCKS):
+                    # 3b: Normalize + gamma + zero-init down_proj (parallel — independent offsets).
+                    with pl.auto_incore():
+                        for kb in pl.parallel(0, HIDDEN_BLOCKS, chunk=8):
                             k0 = kb * K_CHUNK
                             x_chunk = pl.slice(resid1_tile, [TOK_TILE, K_CHUNK], [0, k0])
                             gamma = pl.slice(post_rms_weight, [1, K_CHUNK], [0, k0])
@@ -169,7 +163,7 @@ def build_deepseek_v3_2_prefill_back_program(
                             down_zero_chunk = pl.full([TOK_TILE, K_CHUNK], dtype=pl.FP32, value=0.0)
                             down_fp32_tile = pl.assemble(down_fp32_tile, down_zero_chunk, [0, k0])
 
-                    # Stage 5: MLP gate/up + SiLU + down projection.
+                    # Stage 4: MLP gate/up + SiLU + down projection.
                     for ob in pl.range(MLP_OUT_BLOCKS):
                         o0 = ob * MLP_OUT_CHUNK
 
@@ -214,10 +208,10 @@ def build_deepseek_v3_2_prefill_back_program(
                                 accum = pl.add(down_prev, down_next)
                                 down_fp32_tile = pl.assemble(down_fp32_tile, accum, [0, d0])
 
-                    # Stage 6: Final residual add -> BF16 output.
-                    for ob in pl.range(HIDDEN_BLOCKS):
-                        o0 = ob * K_CHUNK
-                        with pl.incore():
+                    # Stage 5: Final residual add -> BF16 output (parallel — independent offsets).
+                    with pl.auto_incore():
+                        for ob in pl.parallel(0, HIDDEN_BLOCKS, chunk=8):
+                            o0 = ob * K_CHUNK
                             final_sum = pl.add(
                                 pl.slice(down_fp32_tile, [TOK_TILE, K_CHUNK], [0, o0]),
                                 pl.slice(resid1_tile, [TOK_TILE, K_CHUNK], [0, o0]),
@@ -245,7 +239,6 @@ def build_tensor_specs(
         n_blocks = max_seq_len // TOK_TILE
         blocks = torch.randint(1, n_blocks + 1, (batch,), dtype=torch.int32)
         return blocks * TOK_TILE
-    node_id_data = torch.tensor([0], dtype=torch.int32)
 
     def init_hidden_states():
         return torch.rand(batch, max_seq_len, hidden_size) - 0.5
@@ -271,7 +264,6 @@ def build_tensor_specs(
     return [
         TensorSpec("hidden_states", [batch, max_seq_len, hidden_size], torch.bfloat16, init_value=init_hidden_states),
         TensorSpec("seq_lens", [batch], torch.int32, init_value=init_seq_lens),
-        TensorSpec("node_id_t", [1], torch.int32, init_value=node_id_data),
         TensorSpec("combine_buf", [ep_nodes, batch, max_seq_len, attn_out_size], torch.bfloat16, init_value=init_combine_buf),
         TensorSpec("wo", [attn_out_size, hidden_size], torch.bfloat16, init_value=init_wo),
         TensorSpec("post_rms_weight", [1, hidden_size], torch.float32, init_value=init_post_rms_weight),
@@ -299,7 +291,6 @@ def golden_prefill_back(tensors, params):
 
     hidden_states = tensors["hidden_states"]
     seq_lens = tensors["seq_lens"]
-    node_id = tensors["node_id_t"][0].item()
     combine_buf = tensors["combine_buf"]
     wo = tensors["wo"]
     post_rms_weight = tensors["post_rms_weight"]
@@ -326,7 +317,7 @@ def golden_prefill_back(tensors, params):
         sl = slice(0, seq_len_b)
 
         # 1. Attn input from combine_buf.
-        attn_bf16 = combine_buf[node_id, b, sl, :]
+        attn_bf16 = combine_buf[0, b, sl, :]
         hs = hidden_states[b, sl, :].float()
 
         # 2. Output projection + first residual (chunked BF16 matmul, FP32 accum).
@@ -423,3 +414,4 @@ if __name__ == "__main__":
         if result.error:
             print(f"Result: {result.error}")
         raise SystemExit(1)
+
