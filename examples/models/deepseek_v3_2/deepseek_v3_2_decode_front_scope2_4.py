@@ -78,29 +78,23 @@ def build_deepseek_v3_2_decode_front_scope2_stage4_program(
             q_idx_out: pl.Tensor[[BATCH_CFG, INDEX_Q_OUT_CFG], pl.BF16],
             k_idx_out: pl.Tensor[[BATCH_CFG, INDEX_HEAD_DIM_CFG], pl.BF16],
         ) -> pl.Tensor[[BATCH_CFG, INDEX_Q_OUT_CFG], pl.BF16]:
-            q_hadamard_full = pl.create_tensor([BATCH_CFG, INDEX_Q_OUT_CFG], dtype=pl.BF16)
-            k_hadamard = pl.create_tensor([BATCH_CFG, INDEX_HEAD_DIM_CFG], dtype=pl.BF16)
-
             # Stage 4a: Query Hadamard transformation.
             # q_idx_full is shaped as [B, INDEX_HEADS * INDEX_HEAD_DIM].
             # For each head h, slice q[b, h*D : (h+1)*D] and matmul with hadamard_q[D, D].
-            # Result is assembled back into q_hadamard_full[b, h*D : (h+1)*D].
+            # Result is assembled directly into q_idx_out[b, h*D : (h+1)*D].
             with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk]):
                 for h in pl.parallel(0, INDEX_HEADS_CFG, 1, chunk=8):
                     h_offset = h * INDEX_HEAD_DIM_CFG
                     for nb in pl.range(HADAMARD_N_BLOCKS):
                         n0 = nb * HADAMARD_N_CHUNK
-                        q_acc = pl.full([BATCH_TILE, HADAMARD_N_CHUNK], dtype=pl.FP32, value=0.0)
+                        q_acc = pl.full([BATCH_CFG, HADAMARD_N_CHUNK], dtype=pl.FP32, value=0.0)
                         for kb in pl.range(HADAMARD_K_BLOCKS):
                             k0 = kb * HADAMARD_K_CHUNK
-                            # Slice q for this head: [BATCH_TILE, K_CHUNK] from position [0, h*D + k0]
-                            q_tile = pl.cast(
-                                pl.slice(
-                                    q_idx_full,
-                                    [BATCH_TILE, HADAMARD_K_CHUNK],
-                                    [0, h_offset + k0],
-                                ),
-                                target_type=pl.FP32,
+                            # Slice q for this head: [BATCH_CFG, K_CHUNK] from position [0, h*D + k0]
+                            q_tile = pl.slice(
+                                q_idx_full,
+                                [BATCH_CFG, HADAMARD_K_CHUNK],
+                                [0, h_offset + k0],
                             )
                             hadamard_q_tile = pl.slice(
                                 hadamard_q,
@@ -108,14 +102,14 @@ def build_deepseek_v3_2_decode_front_scope2_stage4_program(
                                 [k0, n0],
                             )
                             q_h_tile = pl.matmul(
-                                pl.cast(q_tile, target_type=pl.BF16),
+                                q_tile,
                                 hadamard_q_tile,
                                 out_dtype=pl.FP32,
                             )
                             q_acc = pl.add(q_acc, q_h_tile)
-                        # Assemble into q_hadamard_full at position [0, h*D + n0]
-                        q_hadamard_full = pl.assemble(
-                            q_hadamard_full,
+                        # Assemble directly into q_idx_out at position [0, h*D + n0]
+                        q_idx_out = pl.assemble(
+                            q_idx_out,
                             pl.cast(q_acc, target_type=pl.BF16),
                             [0, h_offset + n0],
                         )
@@ -125,33 +119,26 @@ def build_deepseek_v3_2_decode_front_scope2_stage4_program(
             with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk]):
                 for nb in pl.parallel(0, HADAMARD_N_BLOCKS, 1, chunk=8):
                     n0 = nb * HADAMARD_N_CHUNK
-                    k_acc = pl.full([BATCH_TILE, HADAMARD_N_CHUNK], dtype=pl.FP32, value=0.0)
+                    k_acc = pl.full([BATCH_CFG, HADAMARD_N_CHUNK], dtype=pl.FP32, value=0.0)
                     for kb in pl.range(HADAMARD_K_BLOCKS):
                         k0 = kb * HADAMARD_K_CHUNK
-                        k_tile = pl.cast(
-                            pl.slice(k_idx, [BATCH_TILE, HADAMARD_K_CHUNK], [0, k0]),
-                            target_type=pl.FP32,
-                        )
+                        k_tile = pl.slice(k_idx, [BATCH_CFG, HADAMARD_K_CHUNK], [0, k0])
                         hadamard_k_tile = pl.slice(
                             hadamard_k,
                             [HADAMARD_K_CHUNK, HADAMARD_N_CHUNK],
                             [k0, n0],
                         )
                         k_h_tile = pl.matmul(
-                            pl.cast(k_tile, target_type=pl.BF16),
+                            k_tile,
                             hadamard_k_tile,
                             out_dtype=pl.FP32,
                         )
                         k_acc = pl.add(k_acc, k_h_tile)
-                    k_hadamard = pl.assemble(
-                        k_hadamard,
+                    k_idx_out = pl.assemble(
+                        k_idx_out,
                         pl.cast(k_acc, target_type=pl.BF16),
                         [0, n0],
                     )
-
-            # Assemble outputs
-            q_idx_out = pl.assemble(q_idx_out, q_hadamard_full, [0, 0])
-            k_idx_out = pl.assemble(k_idx_out, k_hadamard, [0, 0])
 
             return q_idx_out
 
