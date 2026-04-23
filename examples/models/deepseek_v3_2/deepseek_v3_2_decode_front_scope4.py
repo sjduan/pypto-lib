@@ -33,6 +33,13 @@ Current standalone differences versus ds32exp.py Scope 4:
 - the standalone validation harness still fills `topk_idx` with the dense
     window `[0..sparse_k)` instead of the arbitrary device-side `topk_idx`
     consumption that ds32exp Scope 4 intends
+    - Observation: read `topk_idx[b, 0]` and `topk_idx[b, kk]` directly.
+        - first element read is lowerable: the generated PTO contains a legal 
+            `pto.load_scalar %arg2[%arg6 * %c16_index + %c0_index]`.
+        - looped reads with the dynamic second index are not lowerable in this 
+            shape `compute_ctx_latent.pto` fails with `expected ']'`, the broken 
+            point appears when lowering the repeated topk_idx[b, kk] scalar load 
+            inside the helper loop.
 - the current `--profile full` preset keeps `batch=1` while restoring the large
     inner dimensions from `batch=16`, this can accelerate the test while still 
     validating the large-dimension logic (around < 10s), and it can be easily 
@@ -48,12 +55,9 @@ Kernel stage order in the rewritten reduced-profile path:
 Defaults are intentionally reduced for faster standalone validation.
 """
 
-import os
-import site
-from pathlib import Path
-
 import pypto.language as pl
 
+import os
 os.environ.setdefault("PTO2_RING_TASK_WINDOW", "524288")
 os.environ.setdefault("PTO2_RING_DEP_POOL", "1048576")
 os.environ.setdefault("PTO2_RING_HEAP", "4294967296")
@@ -148,11 +152,11 @@ def build_deepseek_v3_2_decode_front_scope4_program(
         ) -> pl.Tensor[[ep_nodes_cfg, batch_cfg, attn_out_cfg], pl.BF16]:
             attn_front = pl.create_tensor([batch_cfg, attn_out_cfg], dtype=pl.BF16)
 
-            for b in pl.range(batch_cfg):
+            for b in pl.parallel(0, batch_cfg, 1):
                 attn_row = pl.create_tensor([1, attn_out_cfg], dtype=pl.FP32)
                 sparse_k = pl.min(index_topk_cfg, pl.tensor.read(seq_lens, [b]))
 
-                for h in pl.range(num_heads_cfg):
+                for h in pl.parallel(0, num_heads_cfg, 1):
                     q_col = h * qk_head_dim_cfg
                     v_col = h * v_head_dim_cfg
                     with pl.at(level=pl.Level.CORE_GROUP):
