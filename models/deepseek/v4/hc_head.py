@@ -114,15 +114,8 @@ def hc_head(
     for task in pl.spmd((t_linear // LINEAR_T_TILE) * LINEAR_OK, name_hint="hc_head_linear", allow_early_resolve=True):
         t0 = (task // LINEAR_OK) * LINEAR_T_TILE
         k_base = (task % LINEAR_OK) * LINEAR_K_PER_SPLIT
-        x_linear0 = x_flat[t0 : t0 + LINEAR_T_TILE, k_base : k_base + LINEAR_K_CHUNK]
-        w_chunk0 = pl.slice(
-            hc_head_fn,
-            [HC_PAD, LINEAR_K_CHUNK],
-            [0, k_base],
-            valid_shape=[HC_MULT, LINEAR_K_CHUNK],
-        )
-        acc = pl.matmul(x_linear0, w_chunk0, b_trans=True, out_dtype=pl.FP32)
-        for kb in pl.pipeline(1, LINEAR_CHUNKS_PER_SPLIT, stage=2):
+        acc = pl.create_tensor([LINEAR_T_TILE, HC_PAD], dtype=pl.FP32)
+        for kb in pl.pipeline(0, LINEAR_CHUNKS_PER_SPLIT, stage=2):
             k0 = k_base + kb * LINEAR_K_CHUNK
             x_linear_chunk = x_flat[t0 : t0 + LINEAR_T_TILE, k0 : k0 + LINEAR_K_CHUNK]  # FP32 input -> pure-AIC matmul
             w_chunk = pl.slice(
@@ -131,7 +124,10 @@ def hc_head(
                 [0, k0],
                 valid_shape=[HC_MULT, LINEAR_K_CHUNK],
             )
-            acc = pl.matmul_acc(acc, x_linear_chunk, w_chunk, b_trans=True)
+            if kb == 0:
+                acc = pl.matmul(x_linear_chunk, w_chunk, b_trans=True, out_dtype=pl.FP32)
+            else:
+                acc = pl.matmul_acc(acc, x_linear_chunk, w_chunk, b_trans=True)
         mixes_raw = pl.assemble(mixes_raw, acc, [t0, 0], atomic=pl.AtomicType.Add)
 
     # Fused scale + sigmoid + transpose -> pre_t in one scope (one dispatch).
