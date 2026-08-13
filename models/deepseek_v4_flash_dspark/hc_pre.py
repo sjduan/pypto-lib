@@ -72,7 +72,13 @@ import os
 
 import pypto.language as pl
 
-from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, TP, PREFILL_BATCH, PREFILL_SEQ
+from config import (
+    FLASH as M,
+    DECODE_LOCAL_REQUESTS,
+    DECODE_SEQ,
+    PREFILL_BATCH,
+    PREFILL_SEQ,
+)
 
 
 T_DYN = pl.dynamic("T_DYN")  # T = B * S
@@ -140,10 +146,13 @@ assert HC_MULT == 4, (
     f"hc_pre is specialized to HC_MULT == 4, got {HC_MULT}; "
     "regenerate the pre0..pre3 / row0..row3 unrolling before using it."
 )
-assert (DECODE_BATCH // TP * DECODE_SEQ) % T_TILE == 0
+assert (DECODE_LOCAL_REQUESTS * DECODE_SEQ) % T_TILE == 0
 assert (PREFILL_BATCH * PREFILL_SEQ) % T_TILE == 0
 assert (PREFILL_BATCH * PREFILL_SEQ) % LINEAR_T_TILE == 0
-assert (DECODE_BATCH // TP * DECODE_SEQ) % LINEAR_T_TILE == 0 or DECODE_BATCH // TP * DECODE_SEQ <= LINEAR_T_TILE
+assert (
+    (DECODE_LOCAL_REQUESTS * DECODE_SEQ) % LINEAR_T_TILE == 0
+    or DECODE_LOCAL_REQUESTS * DECODE_SEQ <= LINEAR_T_TILE
+)
 assert HC_DIM % LINEAR_K_CHUNK == 0
 assert HC_DIM % CAST_K_SPMD == 0 and CAST_K_SPMD % RMS_K_CHUNK == 0
 assert HC_DIM % RMS_OK == 0 and RMS_K_PER_SPLIT % RMS_K_CHUNK == 0
@@ -798,7 +807,7 @@ if __name__ == "__main__":
     from golden import ratio_allclose, run_jit
 
     MODES = {
-        "decode":  (DECODE_BATCH // TP, DECODE_SEQ),
+        "decode":  (DECODE_LOCAL_REQUESTS, DECODE_SEQ),
         "prefill": (PREFILL_BATCH, PREFILL_SEQ),
     }
 

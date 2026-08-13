@@ -32,7 +32,7 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 from pypto.ir.distributed_compiled_program import DistributedConfig
 
-from config import DECODE_TOKENS, FLASH as M
+from config import DECODE_RANK_TOKENS, FLASH as M, TP
 
 
 T_DYN = pl.dynamic("LM_HEAD_T_DYN")
@@ -44,7 +44,7 @@ VOCAB = M.vocab_size
 # Parallelism. Static in the frontend, so both worlds are parsed off argv here.
 _TP_CHOICES = (2, 4, 8, 16)
 _DP_CHOICES = (2, 4, 8, 16)
-_TP_DEFAULT = 2
+_TP_DEFAULT = TP
 
 
 def _parse_int_argv(name, default=None):
@@ -62,10 +62,10 @@ TP_SIZE: int = _parse_int_argv("--tp") or _TP_DEFAULT
 DP_SIZE: int = _parse_int_argv("--dp") or TP_SIZE
 VOCAB_PER_TP = VOCAB // TP_SIZE
 
-# Rows. logit_row_indices picks the sources; unused rows stay zero. A decode step
-# samples every one of its DECODE_TOKENS rows (B requests x S target-model
-# token positions: one committed token plus DSPARK_SPEC_TOKENS drafts).
-MAX_LOGIT_ROWS = DECODE_TOKENS
+# Rows. logit_row_indices picks rank-local sources; unused rows stay zero.
+# The capacity matches the rank-local MoE workspace rather than the global
+# request-by-verification-lane product.
+MAX_LOGIT_ROWS = DECODE_RANK_TOKENS
 TEST_TOKENS = 2 * MAX_LOGIT_ROWS  # standalone fixture: hidden rows per card, > MAX_LOGIT_ROWS
 GROUP_LOGIT_ROWS = TP_SIZE * MAX_LOGIT_ROWS
 
@@ -140,7 +140,8 @@ def lm_head(
     # Publish this card's logit rows into every group member's window slot: the
     # window holds one slot per group member and each card writes only its own,
     # `tp_rank * MAX_LOGIT_ROWS`. One block per logit row, one [1, D] put per peer.
-    for row in pl.spmd(MAX_LOGIT_ROWS, name_hint="lm_head_dispatch_push"):
+    with pl.spmd(MAX_LOGIT_ROWS, name_hint="lm_head_dispatch_push") as _dpush_tid:
+        row = pl.tile.get_block_idx()
         hidden_rows = pl.tensor.dim(hidden_states, 0)
         source_row_raw = pl.read(logit_row_indices, [row])
         # Clamp so the load address is always inside hidden_states even if a
@@ -178,7 +179,11 @@ def lm_head(
     # Barrier on the group's publishes. The hidden_states read is an anchor, not
     # data: it deps this task on the hidden-state producer so the wait runs
     # alongside our own push instead of trailing it.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head_dispatch_wait") as _dwait_tid:
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="lm_head_dispatch_wait",
+        deps=[_dpush_tid],
+    ) as _dwait_tid:
         _hidden_anchor = pl.read(hidden_states, [0, 0])
         for owner_tp in pl.range(TP_SIZE):
             if owner_tp != tp_rank:

@@ -35,14 +35,12 @@ SH_M_TILE = 16
 SH_ROW_PAD = 8
 SH_ROWS_PER_BLOCK = 2
 T_PAD = ((T + SH_M_TILE - 1) // SH_M_TILE) * SH_M_TILE
-# Decode (T <= SH_M_TILE, single partial block) or prefill (T a multiple of
-# SH_M_TILE, fully valid blocks); a T that is neither would need a dynamic
-# per-block row count the static valid_shape below can't express.
+# The compile-time tensor capacity remains tile-aligned. Runtime ``num_tokens``
+# selects only the active M-tiles and the final tile's valid rows.
 assert T <= SH_M_TILE or T % SH_M_TILE == 0, \
     "expert_shared needs T <= SH_M_TILE (decode) or T a multiple of SH_M_TILE (prefill)"
-SH_VALID_M = T if T < SH_M_TILE else SH_M_TILE
 N_MTILES = T_PAD // SH_M_TILE
-assert SH_VALID_M % SH_ROWS_PER_BLOCK == 0
+assert SH_M_TILE % SH_ROWS_PER_BLOCK == 0
 
 K_TILE = 512
 INTER_K = 512
@@ -66,10 +64,18 @@ def expert_shared(
     shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
     sh: pl.Tensor[[T, D], pl.BF16],
+    num_tokens: pl.Scalar[pl.INT32],
 ):
-    # One M-tile of SH_M_TILE rows per iteration (decode: 1 tile, T<=16 rows valid;
-    # prefill: T_PAD/SH_M_TILE fully-valid tiles).
-    for mt in pl.parallel(N_MTILES):
+    active_tokens = pl.cast(num_tokens, pl.INDEX)
+    if active_tokens < 0:
+        active_tokens = pl.cast(0, pl.INDEX)
+    if active_tokens > T:
+        active_tokens = pl.cast(T, pl.INDEX)
+    active_mtiles = (active_tokens + SH_M_TILE - 1) // SH_M_TILE
+
+    # One M-tile of SH_M_TILE rows per active iteration. Only the last tile can
+    # be partial; invalid rows stay zero throughout the local INT8 pipeline.
+    for mt in pl.parallel(active_mtiles):
         ts0 = mt * SH_M_TILE
 
         gate_i32 = pl.create_tensor([SH_M_TILE, MOE_INTER], dtype=pl.INT32)
@@ -84,7 +90,9 @@ def expert_shared(
             n0 = nb_idx * MM_INTER_TILE
             gate_acc = pl.create_tensor([SH_M_TILE, MM_INTER_TILE], dtype=pl.INT32)
             for k0 in pl.pipeline(0, D, K_TILE, stage=2):
-                xs_k = pl.slice(x_local_i8, [SH_M_TILE, K_TILE], [ts0, k0], valid_shape=[SH_VALID_M, K_TILE])
+                xs_k = x_local_i8[
+                    ts0 : ts0 + SH_M_TILE, k0 : k0 + K_TILE
+                ]
                 sw1_k = shared_w1[n0 : n0 + MM_INTER_TILE, k0 : k0 + K_TILE]
                 if k0 == 0:
                     gate_acc = pl.matmul(xs_k, sw1_k, b_trans=True, out_dtype=pl.INT32)
@@ -101,7 +109,9 @@ def expert_shared(
             n0 = nb_idx * MM_INTER_TILE
             up_acc = pl.create_tensor([SH_M_TILE, MM_INTER_TILE], dtype=pl.INT32)
             for k0 in pl.pipeline(0, D, K_TILE, stage=2):
-                xs_k = pl.slice(x_local_i8, [SH_M_TILE, K_TILE], [ts0, k0], valid_shape=[SH_VALID_M, K_TILE])
+                xs_k = x_local_i8[
+                    ts0 : ts0 + SH_M_TILE, k0 : k0 + K_TILE
+                ]
                 sw3_k = shared_w3[n0 : n0 + MM_INTER_TILE, k0 : k0 + K_TILE]
                 if k0 == 0:
                     up_acc = pl.matmul(xs_k, sw3_k, b_trans=True, out_dtype=pl.INT32)
@@ -117,10 +127,12 @@ def expert_shared(
             [SH_M_TILE, MOE_INTER], dtype=pl.INT8, init_value=0
         )
         h_tile_scale_dq = pl.create_tensor(
-            [SH_M_TILE, SH_ROW_PAD], dtype=pl.FP32, manual_dep=True
+            [SH_M_TILE, SH_ROW_PAD],
+            dtype=pl.FP32,
+            manual_dep=True,
         )
         for row_block in pl.spmd(
-            SH_VALID_M // SH_ROWS_PER_BLOCK,
+            SH_M_TILE // SH_ROWS_PER_BLOCK,
             name_hint="sh_gate_up_act_q",
         ):
             row0 = row_block * SH_ROWS_PER_BLOCK
@@ -262,7 +274,57 @@ def expert_shared(
                 # Write valid rows straight to the (unpadded) output, mirroring
                 # expert_routed's direct recv_y store; no sh_pad round-trip.
                 y_bf16 = pl.cast(y_2d, target_type=pl.BF16, mode="rint")
-                sh[ts0 : ts0 + SH_VALID_M, d0 : d0 + D_OUT_TILE_ACT] = y_bf16[0:SH_VALID_M, :]
+                sh[
+                    ts0 : ts0 + SH_M_TILE,
+                    d0 : d0 + D_OUT_TILE_ACT,
+                ] = y_bf16
+
+    # A partial final micro-tile still executes a whole 16-row cube operation.
+    # Do not rely on an upstream producer to have padded its inactive rows:
+    # the standalone ABI permits arbitrary tail data, and a future gate
+    # schedule may publish its tail independently.  Overwrite that partial
+    # tile's invalid rows after the down projection so the active-token
+    # contract is owned by this leaf.
+    partial_inactive_rows = active_mtiles * SH_M_TILE - active_tokens
+    if partial_inactive_rows > 0:
+        for fill_task in pl.spmd(
+            partial_inactive_rows * (D // D_OUT_TILE_ACT),
+            name_hint="sh_partial_inactive_zero",
+            allow_early_resolve=True,
+        ):
+            row_offset = fill_task // (D // D_OUT_TILE_ACT)
+            d_block = fill_task - row_offset * (D // D_OUT_TILE_ACT)
+            row = active_tokens + row_offset
+            d0 = d_block * D_OUT_TILE_ACT
+            zero_row = pl.full(
+                [1, D_OUT_TILE_ACT],
+                dtype=pl.BF16,
+                value=0.0,
+            )
+            sh[row : row + 1, d0 : d0 + D_OUT_TILE_ACT] = zero_row
+
+    # Full tiles beyond the active micro-tile frontier are deterministic but do
+    # not execute any expert matmul.
+    inactive_mtiles = N_MTILES - active_mtiles
+    if inactive_mtiles > 0:
+        for fill_task in pl.spmd(
+            inactive_mtiles * (D // D_OUT_TILE_ACT),
+            name_hint="sh_inactive_zero",
+            allow_early_resolve=True,
+        ):
+            mtile = fill_task // (D // D_OUT_TILE_ACT)
+            d_block = fill_task - mtile * (D // D_OUT_TILE_ACT)
+            row0 = (active_mtiles + mtile) * SH_M_TILE
+            d0 = d_block * D_OUT_TILE_ACT
+            zero_rows = pl.full(
+                [SH_M_TILE, D_OUT_TILE_ACT],
+                dtype=pl.BF16,
+                value=0.0,
+            )
+            sh[
+                row0 : row0 + SH_M_TILE,
+                d0 : d0 + D_OUT_TILE_ACT,
+            ] = zero_rows
 
     # The @pl.inline parser requires inline call expressions to have a return
     # value; sh is convenient because it's already pl.Out.
@@ -280,12 +342,13 @@ def expert_shared_test(
     shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
     sh: pl.Out[pl.Tensor[[T, D], pl.BF16]],
+    num_tokens: pl.Scalar[pl.INT32],
 ):
     expert_shared(
         x_local_i8, x_local_scale_dq,
         shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
         shared_w2, shared_w2_scale,
-        sh,
+        sh, num_tokens,
     )
     return sh
 
@@ -305,6 +368,7 @@ def golden_expert_shared(tensors):
 
     x_local_i8 = tensors["x_local_i8"]                       # [T, D] int8
     x_local_scale_dq = tensors["x_local_scale_dq"].float()   # [T, 1]
+    num_tokens = max(0, min(T, int(tensors.get("num_tokens", T))))
     x_local = x_local_i8.float() * x_local_scale_dq
     sw1 = dequant_w(tensors["shared_w1"], tensors["shared_w1_scale"].float())
     sw3 = dequant_w(tensors["shared_w3"], tensors["shared_w3_scale"].float())
@@ -319,6 +383,8 @@ def golden_expert_shared(tensors):
     sh_h_i8, sh_h_sd = int8_quant_per_row(sh_h)
     sh_h = sh_h_i8.float() * sh_h_sd
     sh = sh_h @ sw2.T
+    if num_tokens < T:
+        sh[num_tokens:] = 0
 
     tensors["sh"][:] = sh.to(torch.bfloat16)
 
@@ -357,10 +423,10 @@ def gen_shared_weight(shape, dequant_std, chan_cv):
     return w_i8, scale
 
 
-def build_tensor_specs():
+def build_tensor_specs(num_tokens=T):
     from utils import int8_quant_per_row
     import torch
-    from golden import TensorSpec
+    from golden import ScalarSpec, TensorSpec
 
     # Pre-quantize x_local once so the i8 / scale specs see consistent values
     # (mirrors what gate produces in the full pipeline).
@@ -385,6 +451,7 @@ def build_tensor_specs():
         TensorSpec("shared_w2", [D, MOE_INTER], torch.int8, init_value=lambda: sw2_i8),
         TensorSpec("shared_w2_scale", [D], torch.float32, init_value=lambda: sw2_s),
         TensorSpec("sh", [T, D], torch.bfloat16, is_output=True),
+        ScalarSpec("num_tokens", torch.int32, num_tokens),
     ]
 
 
@@ -398,11 +465,12 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
+    parser.add_argument("--num-tokens", type=int, default=T)
     args = parser.parse_args()
 
     result = run_jit(
         fn=expert_shared_test,
-        specs=build_tensor_specs(),
+        specs=build_tensor_specs(num_tokens=args.num_tokens),
         golden_fn=golden_expert_shared,
         compile_cfg=dict(dump_passes=args.dump_passes),
         runtime_cfg=dict(

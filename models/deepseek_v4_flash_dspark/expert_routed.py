@@ -256,6 +256,33 @@ def expert_routed(
                             )
                     recv_y_flat = pl.assemble(recv_y_flat, recv_y_tile, [flat_tt0, 0])
 
+                # An expert with no received rows used to publish no slice of
+                # ``recv_y`` at all.  Downstream combine still instantiates one
+                # scatter task per local expert; leaving an empty expert without
+                # a producer makes that task's tensor dependency impossible to
+                # satisfy (most visible when one source rank has zero tokens).
+                # Publish a single deterministic sentinel row for empty experts.
+                # It is never consumed as payload because recv_expert_count is
+                # zero, but it closes the task graph without clearing the full
+                # RECV_MAX buffer.
+                if e_rows == 0:
+                    with pl.spmd(
+                        D // D_OUT_TILE_ACT,
+                        name_hint="exp_empty_zero",
+                        allow_early_resolve=True,
+                    ):
+                        empty_d_block = pl.tile.get_block_idx()
+                        empty_d0 = empty_d_block * D_OUT_TILE_ACT
+                        empty_row = pl.full(
+                            [1, D_OUT_TILE_ACT],
+                            dtype=pl.BF16,
+                            value=0.0,
+                        )
+                        recv_y_flat[
+                            e_flat_base : e_flat_base + 1,
+                            empty_d0 : empty_d0 + D_OUT_TILE_ACT,
+                        ] = empty_row
+
     return recv_y
 
 

@@ -81,7 +81,15 @@ def gate(
         active_tokens = pl.cast(0, pl.INDEX)
     if active_tokens > T:
         active_tokens = pl.cast(T, pl.INDEX)
-    active_gate_tiles = (active_tokens + GATE_M_TILE - 1) // GATE_M_TILE
+    # PyPTO cannot currently close the internal xg/score tensor graph when all
+    # of their producer loops have runtime extent zero. Keep one control token
+    # worth of work for an empty source rank; every public output is still
+    # masked by ``active_tokens`` below, so the control tile is semantically
+    # inactive and contributes no route weight.
+    work_tokens = active_tokens
+    if work_tokens == 0:
+        work_tokens = pl.cast(1, pl.INDEX)
+    active_gate_tiles = (work_tokens + GATE_M_TILE - 1) // GATE_M_TILE
     active_gate_tokens = active_gate_tiles * GATE_M_TILE
     if active_gate_tokens > T:
         active_gate_tokens = pl.cast(T, pl.INDEX)
@@ -200,7 +208,7 @@ def gate(
             gp_biased = pl.add(gp_score, gp_bias)
             biased_scores_buf[t1 : t1 + GATE_M_TILE, n0 : n0 + GATE_N_TILE] = gp_biased
 
-    active_route_tiles = (active_tokens + GATE_T_TILE - 1) // GATE_T_TILE
+    active_route_tiles = (work_tokens + GATE_T_TILE - 1) // GATE_T_TILE
     # Hash layers index via tid2eid[input_ids]; score layers sort+gather.
     if layer_id < N_HASH_LAYERS:
         for th_idx in pl.spmd(active_route_tiles, name_hint="route_hash", allow_early_resolve=True):

@@ -17,14 +17,15 @@ import pypto.language as pl
 
 from config import (
     FLASH as M,
-    DECODE_BATCH,
-    TP,
+    DECODE_LOCAL_REQUESTS,
     DECODE_SEQ,
     BLOCK_SIZE,
     KV_ORI_BLOCK_NUM,
     KV_ORI_MAX_BLOCKS,
     INT8_SCALE_MAX,
     INT8_AMAX_EPS,
+    SWA_SOURCE_INVALID,
+    SWA_SOURCE_OVERLAY_BASE,
 )
 
 
@@ -33,7 +34,7 @@ T_DYN = pl.dynamic("T_DYN")  # T = B * S
 ORI_BLOCK_NUM_DYN = pl.dynamic("ORI_BLOCK_NUM_DYN")
 
 # model config
-B = DECODE_BATCH // TP
+B = DECODE_LOCAL_REQUESTS
 S = DECODE_SEQ
 T = B * S
 D = M.hidden_size
@@ -43,7 +44,6 @@ ROPE_DIM = M.qk_rope_head_dim
 HALF_ROPE = ROPE_DIM // 2
 NOPE_DIM = M.nope_head_dim
 WIN = M.sliding_window
-MAX_SEQ_LEN = M.max_position_embeddings
 SOFTMAX_SCALE = M.softmax_scale
 O_LORA = M.o_lora_rank
 O_GROUPS = M.o_groups
@@ -95,7 +95,8 @@ assert WIN == ATTN_K_TILE, f"SWA decode expects WIN ({WIN}) == ATTN_K_TILE ({ATT
 def sparse_attn_swa_heads(
     q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
+    current_kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
+    swa_sources: pl.Tensor[[T_DYN, WIN], pl.INT32],
     sparse_bias: pl.Tensor[[T_DYN, PADDED_TOPK], pl.FP32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
@@ -116,10 +117,10 @@ def sparse_attn_swa_heads(
     rope_cs_blocks = t_dim // ROPE_CS_T_TILE
     ori_block_num = pl.tensor.dim(ori_kv, 0)
     ori_kv_flat = pl.reshape(ori_kv, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
-    # SWA metadata already lowered each logical window row to a physical cache
-    # slot. Current decode tokens must be inserted into ori_kv by the caller
-    # before this function runs; there is no speculative overlay path here.
-
+    # Metadata lowers history rows to physical cache slots and encodes current
+    # step rows as negative overlay sources.  The projection temporaries live
+    # in ``sparse_attn_swa_local_o_proj`` after the upstream heads/projection
+    # split, not in this producer stage.
     swa_kv_flat = pl.create_tensor([t_win, HEAD_DIM], dtype=pl.BF16)
     gather_tids = pl.array.create(1, pl.TASK_ID)
     with pl.spmd(t_gather, name_hint="swa_gather_kv") as gather_tid:
@@ -133,10 +134,8 @@ def sparse_attn_swa_heads(
         for g_sub in pl.range(GATHER_ROWS_PER_TASK // GATHER_RUN):
             g_sr0 = g_r0 + g_sub * GATHER_RUN
             g_sdst = g_base + g_sr0
-            g_first = pl.read(swa_indices, [g_t, g_sr0])
-            g_last = pl.read(swa_indices, [g_t, g_sr0 + GATHER_RUN - 1])
-            # A -1 slot anywhere in the run pins g_run_ok below the match value,
-            # so an invalid or block-straddling run takes the per-row path.
+            g_first = pl.read(swa_sources, [g_t, g_sr0])
+            g_last = pl.read(swa_sources, [g_t, g_sr0 + GATHER_RUN - 1])
             g_run_ok = (g_last - g_first) + pl.min(g_first, 0) * GATHER_RUN
             if g_run_ok == GATHER_RUN - 1:
                 g_run_src = pl.cast(g_first, pl.INDEX)
@@ -146,13 +145,19 @@ def sparse_attn_swa_heads(
             else:
                 for g_dr in pl.range(GATHER_RUN):
                     g_dst = g_sdst + g_dr
-                    g_slot_i32 = pl.read(swa_indices, [g_t, g_sr0 + g_dr])
-                    if g_slot_i32 >= 0:
-                        g_slot = pl.cast(g_slot_i32, pl.INDEX)
+                    g_source = pl.read(swa_sources, [g_t, g_sr0 + g_dr])
+                    if g_source >= 0:
+                        g_slot = pl.cast(g_source, pl.INDEX)
                         swa_kv_flat[g_dst : g_dst + 1, 0 : HEAD_DIM] = ori_kv_flat[g_slot : g_slot + 1, 0 : HEAD_DIM]
                     else:
-                        swa_kv_flat[g_dst : g_dst + 1, 0 : HEAD_DIM] = pl.full(
-                            [1, HEAD_DIM], dtype=pl.BF16, value=0.0)
+                        if g_source <= SWA_SOURCE_OVERLAY_BASE:
+                            g_overlay = pl.cast(SWA_SOURCE_OVERLAY_BASE - g_source, pl.INDEX)
+                            swa_kv_flat[g_dst : g_dst + 1, 0 : HEAD_DIM] = current_kv[
+                                g_overlay : g_overlay + 1, 0 : HEAD_DIM
+                            ]
+                        else:
+                            swa_kv_flat[g_dst : g_dst + 1, 0 : HEAD_DIM] = pl.full(
+                                [1, HEAD_DIM], dtype=pl.BF16, value=0.0)
     gather_tids[0] = gather_tid
 
     # qk_pv writes per-tile (mi, li, oi) to GM; merge_norm reads them back. Not
@@ -435,7 +440,8 @@ def sparse_attn_swa_local_o_proj(
 def sparse_attn_swa(
     q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
+    current_kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
+    swa_sources: pl.Tensor[[T_DYN, WIN], pl.INT32],
     sparse_bias: pl.Tensor[[T_DYN, PADDED_TOPK], pl.FP32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
@@ -448,23 +454,27 @@ def sparse_attn_swa(
     """Compute SWA sparse attention and the grouped output projection."""
     o_packed_heads = pl.create_tensor([O_GROUPS * T_PAD * HEADS_PER_GROUP, HEAD_DIM], dtype=pl.BF16)
     o_packed_heads, heads_dep = sparse_attn_swa_heads(
-        q, ori_kv, swa_indices, sparse_bias,
+        q, ori_kv, current_kv, swa_sources, sparse_bias,
         attn_sink, freqs_cos, freqs_sin,
         o_packed_heads,
     )
-    attn_out = sparse_attn_swa_local_o_proj(
+    sparse_attn_swa_local_o_proj(
         o_packed_heads,
         wo_a, wo_b, wo_b_scale,
         attn_out, heads_dep,
     )
-    return attn_out
+    # The caller delays raw-cache overwrite until every historical read is
+    # complete.  merge_tid is a conservative completion fence that includes
+    # the gather and qk/pv consumers; the local projection does not read KV.
+    return heads_dep
 
 
 @pl.jit
 def sparse_attn_test(
     q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
+    current_kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
+    swa_sources: pl.Tensor[[T_DYN, WIN], pl.INT32],
     swa_lens: pl.Tensor[[T_DYN], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
@@ -475,7 +485,8 @@ def sparse_attn_test(
     attn_out: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
 ):
     q.bind_dynamic(0, T_DYN)
-    swa_indices.bind_dynamic(0, T_DYN)
+    current_kv.bind_dynamic(0, T_DYN)
+    swa_sources.bind_dynamic(0, T_DYN)
     swa_lens.bind_dynamic(0, T_DYN)
     freqs_cos.bind_dynamic(0, T_DYN)
     freqs_sin.bind_dynamic(0, T_DYN)
@@ -497,7 +508,8 @@ def sparse_attn_test(
     sparse_attn_swa(
         q,
         ori_kv,
-        swa_indices,
+        current_kv,
+        swa_sources,
         sparse_bias,
         attn_sink,
         freqs_cos,
@@ -517,7 +529,8 @@ def golden_sparse_attn(tensors):
     q = tensors["q"].float()
     ori_kv = tensors["ori_kv"].float()
     ori_kv_flat = ori_kv.reshape(ori_kv.shape[0] * BLOCK_SIZE, HEAD_DIM)
-    swa_indices = tensors["swa_indices"]
+    current_kv = tensors["current_kv"].float()
+    swa_sources = tensors["swa_sources"]
     swa_lens = tensors["swa_lens"]
     attn_sink = tensors["attn_sink"].float()
     cos = tensors["freqs_cos"].float()
@@ -530,13 +543,16 @@ def golden_sparse_attn(tensors):
     batch = tokens // S
     o = torch.zeros(tokens, H, HEAD_DIM)
 
-    # Per-query-token attention. swa_indices is the authoritative physical
-    # cache-row list; invalid tail columns are -1 and swa_lens gives the valid
-    # prefix length.
+    def source_row(source: int):
+        if source >= 0:
+            return ori_kv_flat[source]
+        if source <= SWA_SOURCE_OVERLAY_BASE:
+            return current_kv[SWA_SOURCE_OVERLAY_BASE - source]
+        return None
+
     for t in range(tokens):
         valid_len = int(swa_lens[t].item())
-        valid_slots = [int(v) for v in swa_indices[t, :valid_len].tolist() if int(v) >= 0]
-        if not valid_slots:
+        if valid_len <= 0:
             continue
 
         q_t = q[t]
@@ -547,9 +563,12 @@ def golden_sparse_attn(tensors):
         for sb in range(SPARSE_BLOCKS):
             start = sb * ATTN_K_TILE
             end = min(start + ATTN_K_TILE, WIN)
-            slots = swa_indices[t, start:end].tolist()
+            sources = swa_sources[t, start:end].tolist()
             valid_tile = torch.tensor(
-                [start + i < valid_len and int(slot) >= 0 for i, slot in enumerate(slots)],
+                [
+                    start + i < valid_len and int(source) != SWA_SOURCE_INVALID
+                    for i, source in enumerate(sources)
+                ],
                 dtype=torch.bool,
             )
             if end - start < ATTN_K_TILE:
@@ -559,12 +578,12 @@ def golden_sparse_attn(tensors):
                 ])
             valid_tile = valid_tile.to(device=ori_kv.device)
             kv_tile = torch.zeros(ATTN_K_TILE, HEAD_DIM, dtype=ori_kv.dtype, device=ori_kv.device)
-            for r, slot in enumerate(slots):
+            for r, source in enumerate(sources):
                 if r >= ATTN_K_TILE:
                     break
-                slot_i = int(slot)
-                if slot_i >= 0:
-                    kv_tile[r] = ori_kv_flat[slot_i]
+                row = source_row(int(source))
+                if row is not None:
+                    kv_tile[r] = row
             scores = (q_t @ kv_tile.T) * SOFTMAX_SCALE
             scores = scores.masked_fill(~valid_tile.unsqueeze(0), NEG_INF)
             mi = scores.max(dim=-1, keepdim=True).values
@@ -621,60 +640,72 @@ def golden_sparse_attn(tensors):
 
     tensors["attn_out"][:] = out.to(torch.bfloat16)
 
-def build_tensor_specs(
-    causal_regression_fixture: bool = False,
-    short_window_fixture: bool = False,
-    batch: int = B,
-):
+LEAF_CASES = ("full_window", "short_window", "causal_overlay", "ring_wrap")
+
+
+def build_tensor_specs(case: str = "full_window", batch: int = B):
     """Build deterministic demo tensors for the merged standalone harness."""
+    if case not in LEAF_CASES:
+        raise ValueError(f"unknown sparse SWA case: {case!r}")
     tokens = batch * S
     import torch
     from golden import TensorSpec
-    from utils import block_table, quant_w_per_channel
+    from utils import quant_w_per_channel
 
     def init_q():
         """Initialize the query tensor used by the decode attention stage."""
         q = torch.rand(tokens, H, HEAD_DIM) - 0.5
-        if causal_regression_fixture:
+        if case == "causal_overlay":
             q[0].fill_(1.0)
         return q
 
     def init_ori_kv():
         """Initialize the sliding-window KV cache pages."""
         kv = torch.rand(ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM) - 0.5
-        if causal_regression_fixture:
-            kv[0, WIN - 1, 0].fill_(8.0)
+        if case == "causal_overlay":
+            kv[3, BLOCK_SIZE - 1, 0].fill_(8.0)
+        return kv
+
+    def init_current_kv():
+        kv = torch.rand(tokens, HEAD_DIM) - 0.5
+        if case == "causal_overlay":
+            kv[0].fill_(0.25)
+            kv[1].fill_(16.0)
         return kv
 
     def init_attn_sink():
         """Initialize the per-head sink logits to zero."""
         return torch.zeros(H)
 
-    def init_ori_block_table():
-        """Build the demo block table for the sliding-window cache pages."""
-        return block_table(batch=batch, table_blocks=ORI_MAX_BLOCKS, physical_blocks=ORI_BLOCK_NUM)
-
     def init_swa_lens():
         lens = torch.full((tokens,), WIN, dtype=torch.int32)
-        if short_window_fixture:
+        if case == "short_window":
             lens.fill_(17)
         return lens
 
-    def init_swa_indices():
-        """Build physical cache-row indices for the standalone SWA fixture."""
-        tbl = init_ori_block_table()
-        indices = torch.full((tokens, WIN), -1, dtype=torch.int32)
+    def init_swa_sources():
+        sources = torch.full((tokens, WIN), SWA_SOURCE_INVALID, dtype=torch.int32)
         lens = init_swa_lens()
         for t in range(tokens):
             b = t // S
+            s_idx = t % S
+            page_base = (3 + 4 * b) % (ORI_BLOCK_NUM - WIN // BLOCK_SIZE + 1)
             valid_len = int(lens[t].item())
-            for w in range(valid_len):
-                logical_blk = w // BLOCK_SIZE
-                intra = w % BLOCK_SIZE
-                blk = int(tbl[b, logical_blk].item())
-                if blk >= 0:
-                    indices[t, w] = blk * BLOCK_SIZE + intra
-        return indices
+            if case in ("causal_overlay", "ring_wrap"):
+                first_position = 127 if case == "causal_overlay" else 128
+                position = first_position + s_idx
+                window_begin = position + 1 - WIN
+                for w, logical_position in enumerate(range(window_begin, position + 1)):
+                    overlay_offset = logical_position - first_position
+                    if 0 <= overlay_offset <= s_idx:
+                        overlay_query = b * S + overlay_offset
+                        sources[t, w] = SWA_SOURCE_OVERLAY_BASE - overlay_query
+                    else:
+                        sources[t, w] = page_base * BLOCK_SIZE + logical_position % WIN
+            else:
+                for w in range(valid_len):
+                    sources[t, w] = page_base * BLOCK_SIZE + w
+        return sources
 
     def init_cos():
         """Build the split-half cosine table used by the inverse-RoPE reference."""
@@ -706,7 +737,8 @@ def build_tensor_specs(
     return [
         TensorSpec("q", [tokens, H, HEAD_DIM], torch.bfloat16, init_value=init_q),
         TensorSpec("ori_kv", [ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_ori_kv),
-        TensorSpec("swa_indices", [tokens, WIN], torch.int32, init_value=init_swa_indices),
+        TensorSpec("current_kv", [tokens, HEAD_DIM], torch.bfloat16, init_value=init_current_kv),
+        TensorSpec("swa_sources", [tokens, WIN], torch.int32, init_value=init_swa_sources),
         TensorSpec("swa_lens", [tokens], torch.int32, init_value=init_swa_lens),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
         TensorSpec("freqs_cos", [tokens, ROPE_DIM], torch.bfloat16, init_value=init_cos),
@@ -729,10 +761,11 @@ if __name__ == "__main__":
                         help=f"runtime request count; a multiple of 4 up to {B} (the compile-time "
                              "upper bound). The token axis is pl.dynamic, so one compiled program "
                              "serves every value.")
+    parser.add_argument("--case", choices=LEAF_CASES, default="full_window")
     parser.add_argument("--causal-regression-fixture", action="store_true", default=False,
-                        help="Amplify the S=2 future-window-slot regression.")
+                        help="Compatibility alias for --case causal_overlay.")
     parser.add_argument("--short-window-fixture", action="store_true", default=False,
-                        help="Use a short-window topk row with valid prefix + -1 padding.")
+                        help="Compatibility alias for --case short_window.")
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2, 4))
     parser.add_argument("--enable-dep-gen", action="store_true", default=False,
@@ -743,16 +776,19 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if args.batch < 4 or args.batch > B or args.batch % 4 != 0:
         parser.error(f"--batch must be a multiple of 4 in [4, {B}], got {args.batch}")
+    selected_case = args.case
+    if args.causal_regression_fixture:
+        selected_case = "causal_overlay"
+    if args.short_window_fixture:
+        if args.causal_regression_fixture:
+            parser.error("the causal and short-window compatibility flags are mutually exclusive")
+        selected_case = "short_window"
 
     print(f"TOPK={TOPK} SPARSE_BLOCKS={SPARSE_BLOCKS} PADDED_TOPK={PADDED_TOPK}", flush=True)
 
     result = run_jit(
         fn=sparse_attn_test,
-        specs=build_tensor_specs(
-            args.causal_regression_fixture,
-            args.short_window_fixture,
-            batch=args.batch,
-        ),
+        specs=build_tensor_specs(selected_case, batch=args.batch),
         golden_fn=golden_sparse_attn,
         golden_data=args.golden_data,
         compile_cfg=dict(dump_passes=args.dump_passes),

@@ -19,7 +19,7 @@ import sys
 import config
 
 _EP_CHOICES = (2, 4, 8, 16)
-_EP_DEFAULT = 2
+_EP_DEFAULT = config.EP
 
 
 def _parse_ep_argv():
@@ -144,13 +144,21 @@ def dispatch(
             active_tokens = pl.cast(0, pl.INDEX)
         if active_tokens > T:
             active_tokens = pl.cast(T, pl.INDEX)
+        # Preserve a real data-path transaction for an empty source rank. Gate
+        # has already zeroed row 0 (payload, route weights, and indices), so this
+        # one dummy token contributes exactly zero while ensuring every EP phase
+        # has a concrete producer/consumer path. The public active count remains
+        # zero and combine never exposes the dummy row.
+        transport_tokens = active_tokens
+        if transport_tokens == 0:
+            transport_tokens = pl.cast(1, pl.INDEX)
 
         # Count how many routes land in each (dst, loc_e) lane (no payload move).
         cursor = pl.array.create(N_RANKS * N_LOCAL, pl.INT32)
         for d in pl.range(N_RANKS):
             for e in pl.range(N_LOCAL):
                 cursor[d * N_LOCAL + e] = 0
-        for t in pl.range(active_tokens):
+        for t in pl.range(transport_tokens):
             for k in pl.range(TOPK):
                 eid = pl.read(indices, [t, k])
                 dst = eid // N_LOCAL
@@ -200,13 +208,20 @@ def dispatch(
     # loc_e on EVERY destination rank, so the blocking cross-rank puts fan out
     # across N_LOCAL cores. One slot counter per destination rank; token-major
     # order matches the meta pass's per-(dst, loc_e) cumulative count.
-    with pl.spmd(N_LOCAL, name_hint="dispatch_push", allow_early_resolve=True):
+    with pl.spmd(
+        N_LOCAL,
+        name_hint="dispatch_push",
+        allow_early_resolve=True,
+    ) as _push_tid:
         loc_e = pl.tile.get_block_idx()
         active_tokens = pl.cast(num_tokens, pl.INDEX)
         if active_tokens < 0:
             active_tokens = pl.cast(0, pl.INDEX)
         if active_tokens > T:
             active_tokens = pl.cast(T, pl.INDEX)
+        transport_tokens = active_tokens
+        if transport_tokens == 0:
+            transport_tokens = pl.cast(1, pl.INDEX)
 
         slot_ctr = pl.array.create(N_RANKS, pl.INT32)
         for d in pl.range(N_RANKS):
@@ -216,7 +231,7 @@ def dispatch(
         # Pad tiles zeroed once; used cols overwritten per push, then remote_store.
         aux_tile = pl.tile.full([1, AUX_PAD], dtype=pl.FP32, value=0.0)
         route_tile = pl.tile.full([1, IDX_PAD], dtype=pl.INT32, value=0)
-        for t in pl.range(active_tokens):
+        for t in pl.range(transport_tokens):
             for k in pl.range(TOPK):
                 eid = pl.read(indices, [t, k])
                 dst = eid // N_LOCAL
@@ -257,13 +272,18 @@ def dispatch(
                     op=pld.NotifyOp.AtomicAdd,
                 )
 
-    # Wait only (the notify rides inside dispatch_push). The indices read is an
-    # anchor, not data: it deps this task on gate's route tasks, so the wait starts
-    # with dispatch_push instead of trailing dispatch_meta's spin. Anchor it to
-    # something -- an unanchored wait is dispatched immediately and spins holding a
-    # core group, so pipelined layers stack up spinners.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_wait", allow_early_resolve=True) as _wait_tid:
-        _idx_anchor = pl.read(indices, [0, 0])
+    # Wait only (the notify rides inside dispatch_push).  A zero-token source
+    # finishes gate much earlier than its peers; launching its waiter from an
+    # indices anchor alone can hit the device spin watchdog before a busy peer
+    # reaches its push.  Join the local push and the metadata barrier first.
+    # The metadata barrier proves every peer has completed route counting, so
+    # the subsequent payload wait has bounded producer skew.
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="dispatch_wait",
+        deps=[_push_tid, _meta_tid],
+        allow_early_resolve=True,
+    ) as _wait_tid:
         for src in pl.range(N_RANKS):
             if src != my_rank:
                 pld.system.wait(
@@ -325,7 +345,11 @@ def combine(
     # unique (dst, loc_e) and r_route, so the blocks' puts are write-disjoint.
     # allow_early_resolve: shared_routed pre-stages only when every producer of its
     # fanin is flagged, and combine_wait already is.
-    with pl.spmd(N_LOCAL, name_hint="combine", allow_early_resolve=True):
+    with pl.spmd(
+        N_LOCAL,
+        name_hint="combine",
+        allow_early_resolve=True,
+    ) as _scatter_tid:
         e = pl.tile.get_block_idx()
         e_base_row = e * RECV_MAX
         b = pl.cast(0, pl.INDEX)
@@ -359,14 +383,16 @@ def combine(
                     op=pld.NotifyOp.AtomicAdd,
                 )
 
-    # Wait only (the notify rides inside the scatter), so it spins on the peers'
-    # counters while our own scatter runs. The recv_y_flat read is an anchor, not
-    # data: it auto-deps this task on exp_w2_act, starting the wait when the scatter
-    # starts. Anchor it to something -- a wait with no dep at all is dispatched the
-    # moment the scheduler reaches it and spins holding a core group, so pipelined
-    # layers stack up spinners that starve the scatters they wait on.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="combine_wait", allow_early_resolve=True) as _cwait_tid:
-        _recv_y_anchor = pl.read(recv_y_flat, [0, 0])
+    # Wait only after this rank has completed all of its scatter tasks and sent
+    # their notifications.  Besides being a clear completion boundary, this
+    # avoids a zero-work source rank launching a long-lived spinner while peers
+    # are still executing routed experts.
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="combine_wait",
+        deps=[_scatter_tid],
+        allow_early_resolve=True,
+    ) as _cwait_tid:
         for src in pl.range(N_RANKS):
             if src != my_rank:
                 pld.system.wait(
@@ -467,7 +493,7 @@ def moe(
         x_norm_i8, x_norm_scale,
         shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
         shared_w2, shared_w2_scale,
-        sh,
+        sh, num_tokens,
     )
 
     recv_x_out = pl.create_tensor([N_LOCAL, RECV_MAX, D], dtype=pl.INT8)
@@ -640,7 +666,21 @@ def golden_moe(tensors):
     from expert_routed import golden_expert_routed
 
     x_next_out = torch.zeros(N_RANKS, T, HC_MULT, D, dtype=torch.float32)
-    num_tokens = max(0, min(T, int(tensors.get("num_tokens", T))))
+    raw_counts = tensors.get(
+        "num_tokens_per_owner",
+        tensors.get("num_tokens", T),
+    )
+    if isinstance(raw_counts, torch.Tensor) and raw_counts.numel() > 1:
+        if raw_counts.numel() != N_RANKS:
+            raise ValueError(
+                "num_tokens_per_owner must contain one count per MoE rank"
+            )
+        num_tokens_per_rank = [
+            max(0, min(T, int(value))) for value in raw_counts.reshape(-1).tolist()
+        ]
+    else:
+        count = max(0, min(T, int(raw_counts)))
+        num_tokens_per_rank = [count] * N_RANKS
 
     # Stages 1-2: hc_pre + gate per rank. Rank-independent, so compute once and
     # reuse for both the dispatch replay and each rank's local stages.
@@ -651,6 +691,7 @@ def golden_moe(tensors):
     all_scale = []
     all_weights = []
     for src in range(N_RANKS):
+        src_num_tokens = num_tokens_per_rank[src]
         src_x_mixed = torch.zeros(T, D, dtype=torch.bfloat16)
         src_post = torch.zeros(T, HC_MULT, dtype=torch.float32)
         src_comb = torch.zeros(T, HC_MULT * HC_MULT, dtype=torch.float32)
@@ -673,7 +714,7 @@ def golden_moe(tensors):
             "gate_w":       tensors["gate_w"][src],
             "gate_bias":    tensors["gate_bias"][src],
             "layer_id":     tensors["layer_id"],
-            "num_tokens":   tensors["num_tokens"],
+            "num_tokens":   src_num_tokens,
             "tid2eid":      tensors["tid2eid"][src],
             "input_ids":    tensors["input_ids"][src],
             "x_norm_i8":    src_x_norm_i8,
@@ -691,7 +732,7 @@ def golden_moe(tensors):
     # Route counts per (src, dst, local expert); drives the per-source lane cumsum.
     send_counts = torch.zeros(N_RANKS, N_RANKS, N_LOCAL, dtype=torch.int32)
     for src in range(N_RANKS):
-        for t in range(num_tokens):
+        for t in range(num_tokens_per_rank[src]):
             for k in range(TOPK):
                 eid = int(all_indices[src][t, k].item())
                 send_counts[src, eid // N_LOCAL, eid % N_LOCAL] += 1
@@ -715,7 +756,7 @@ def golden_moe(tensors):
             d_recv_count[e, 0] = int(d_running[e].item())
         for src in range(N_RANKS):
             cursor = torch.zeros(N_LOCAL, dtype=torch.int32)
-            for t in range(num_tokens):
+            for t in range(num_tokens_per_rank[src]):
                 for k in range(TOPK):
                     eid = int(all_indices[src][t, k].item())
                     if eid // N_LOCAL != dst:
@@ -743,6 +784,7 @@ def golden_moe(tensors):
         dst_recv_y[dst] = d_recv_y
 
     for r in range(N_RANKS):
+        rank_num_tokens = num_tokens_per_rank[r]
         x_norm_i8 = all_x_i8[r]
         x_norm_scale = all_scale[r]
         post_t = all_post[r]
@@ -753,7 +795,7 @@ def golden_moe(tensors):
         golden_expert_shared({
             "x_local_i8":       x_norm_i8,
             "x_local_scale_dq": x_norm_scale,
-            "num_tokens":       tensors["num_tokens"],
+            "num_tokens":       rank_num_tokens,
             "shared_w1":        tensors["shared_w1"][r],
             "shared_w1_scale":  tensors["shared_w1_scale"][r],
             "shared_w3":        tensors["shared_w3"][r],
@@ -767,7 +809,7 @@ def golden_moe(tensors):
         # rank, find the (loc_e, slot) on rank dst where the SwiGLU result
         # landed, then accumulate by r_route = t*TOPK+k.
         my_routes = []
-        for t in range(num_tokens):
+        for t in range(rank_num_tokens):
             for k in range(TOPK):
                 eid = int(all_indices[r][t, k].item())
                 dst = eid // N_LOCAL
@@ -789,7 +831,7 @@ def golden_moe(tensors):
         # Stage 7: reduce + sh + hc_post
         acc = sh.float().clone()
         for k in range(TOPK):
-            for t in range(num_tokens):
+            for t in range(rank_num_tokens):
                 acc[t, :] += routed_y_buf_r[t * TOPK + k, :].float()
         ffn_out = acc.to(torch.bfloat16)
         x_next_r = torch.zeros(T, HC_MULT, D, dtype=torch.float32)

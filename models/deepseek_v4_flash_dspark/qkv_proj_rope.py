@@ -12,7 +12,15 @@ attention-normalized inputs for both decode and prefill attention paths."""
 
 import pypto.language as pl
 
-from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, TP, PREFILL_BATCH, PREFILL_SEQ, INT8_SCALE_MAX, INT8_AMAX_EPS
+from config import (
+    FLASH as M,
+    DECODE_LOCAL_REQUESTS,
+    DECODE_SEQ,
+    PREFILL_BATCH,
+    PREFILL_SEQ,
+    INT8_SCALE_MAX,
+    INT8_AMAX_EPS,
+)
 
 
 # Dynamic shape variables. The q branch, the kv branch and the rope tables each
@@ -648,7 +656,7 @@ if __name__ == "__main__":
     from golden import ratio_allclose, run_jit
 
     MODES = {
-        "decode":  (DECODE_BATCH // TP, DECODE_SEQ),
+        "decode":  (DECODE_LOCAL_REQUESTS, DECODE_SEQ),
         "prefill": (PREFILL_BATCH, PREFILL_SEQ),
     }
 
