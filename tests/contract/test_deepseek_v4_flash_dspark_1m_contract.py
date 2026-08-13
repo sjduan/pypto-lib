@@ -296,6 +296,62 @@ def test_topk_implementation_is_bounded_and_branch_free() -> None:
     assert "MAX_CONTEXT_TOKENS" not in source
 
 
+def test_csa_chunk_pair_arena_is_static_and_does_not_escape_scope() -> None:
+    """The nested-inline chunk helper must not reference a module-scope DynVar.
+
+    Phase H closes the EP4 Full43 ConvertToSSA blocker
+    (``Variable 'LAYER_CSA_ARENA_DYN' used outside its defining scope``) by
+    replacing the escaped ``CSA_ARENA_DYN`` annotation on
+    ``decode_layer_csa_chunk.pair_arena`` with a static compile-time bound.
+    A module-scope ``pl.dynamic`` symbol that is never ``bind_dynamic``-ed
+    inside the inline boundary escapes its IR scope after inline expansion.
+    """
+    source = _source("decode_layer.py")
+    tree = ast.parse(source)
+    chunk = _function(tree, "decode_layer_csa_chunk")
+
+    # The production nested-inline ABI must not carry the escaped DynVar.
+    assert "CSA_ARENA_DYN" not in source
+    assert "LAYER_CSA_ARENA_DYN" not in source
+
+    # The arena bound is a static expression fixed by the chunk/request caps.
+    assert "CSA_CHUNK_ARENA_ROWS = CSA_CHUNK_T * CSA_MAX_NODES_PER_QUERY" in source
+    assert "assert CSA_CHUNK_ARENA_ROWS == 4080" in source
+
+    pair_arena = _annotation_text(chunk, "pair_arena")
+    assert "CSA_CHUNK_ARENA_ROWS" in pair_arena
+    assert "CSA_ARENA_DYN" not in pair_arena
+
+    # The descriptor extents (leaf/pair/singleton/upper) stay dynamic: only the
+    # arena scratch is static, never the visible candidate/merge frontier.
+    for name, dyn in (
+        ("leaf_descriptors", "CSA_LEAF_DYN"),
+        ("pair_descriptors", "CSA_PAIR_DYN"),
+        ("singleton_descriptors", "CSA_SINGLETON_DYN"),
+        ("upper_descriptors", "CSA_UPPER_DYN"),
+    ):
+        annotation = _annotation_text(chunk, name)
+        assert dyn in annotation, name
+
+    # The enclosing layer allocates the arena with the same static shape so the
+    # annotation and the created tensor agree after inline expansion.
+    layer = _function(tree, "decode_layer_csa")
+    layer_source = ast.unparse(layer)
+    assert (
+        "pl.create_tensor([CSA_CHUNK_ARENA_ROWS, CSA_PAIR_WIDTH]"
+        in layer_source
+    )
+
+    # The public standalone diagnostic entry also uses the static chunk-wide
+    # arena bound: it calls the ``indexer`` inline helper, whose ``pair_arena``
+    # annotation is now static ``TOPK_ARENA_ROWS``.  A standalone DynVar that is
+    # never ``bind_dynamic``-ed would escape the inline expansion it drives.
+    standalone = _function(tree, "csa_indexer_layer_stage")
+    standalone_arena = _annotation_text(standalone, "pair_arena")
+    assert "TOPK_ARENA_ROWS" in standalone_arena
+    assert "CSA_INDEXER_ARENA_DYN" not in standalone_arena
+
+
 def test_active_topk_batches_the_long_context_submission_frontier() -> None:
     source = _source("decode_indexer_topk.py")
     tree = ast.parse(source)

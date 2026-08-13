@@ -15,6 +15,7 @@ from config import (
     CSA_CANDIDATES_PER_LEAF,
     CSA_MAX_CANDIDATES,
     CSA_MAX_LEAVES_PER_QUERY,
+    CSA_MAX_NODES_PER_QUERY,
     CSA_MAX_QUERIES,
     CSA_MAX_TOPK_TASKS,
     CSA_PAIR_WIDTH,
@@ -60,7 +61,6 @@ POC_READY_FRONTIER = 1
 
 LEAF_DYN = pl.dynamic("LEAF_DYN")
 QUERY_DYN = pl.dynamic("QUERY_DYN")
-ARENA_DYN = pl.dynamic("ARENA_DYN")
 PAIR_GROUP_DYN = pl.dynamic("PAIR_GROUP_DYN")
 SINGLETON_DYN = pl.dynamic("SINGLETON_DYN")
 UPPER_MERGE_DYN = pl.dynamic("UPPER_MERGE_DYN")
@@ -82,16 +82,30 @@ CSA_TOPK_MAX_PAIR_WAVES = (
 ) // CSA_TOPK_PAIR_GRID_W
 assert CSA_MAX_CANDIDATES_FP32 == CSA_MAX_CANDIDATES
 
+# The pair arena is the loop-carried merge-forest scratch.  Its compile-time
+# capacity is the whole chunk's legal forest node bound: one query contributes
+# at most ``CSA_MAX_NODES_PER_QUERY`` rows, and a CSA micro-shard spans up to
+# ``CSA_MAX_QUERIES`` queries.  The ``@pl.jit.inline`` forest helpers below
+# carry this tensor through nested ``pl.range`` loops and return it; using a
+# static bound (instead of a module-scope DynVar) keeps the symbol
+# inside its own IR scope after inline expansion.  A DynVar that is only
+# ``bind_dynamic``-ed by a ``@pl.jit`` entry (the standalone tests) cannot be
+# re-anchored from inside an inline body, because the specializer that
+# interprets ``bind_dynamic`` never runs on spliced inline code.  4080 is a
+# capacity bound only; the actual visible leaf/merge task count stays dynamic.
+TOPK_ARENA_ROWS = CSA_MAX_QUERIES * CSA_MAX_NODES_PER_QUERY
+assert TOPK_ARENA_ROWS == 4080
+
 
 @pl.jit.incore
 def select_2k_top512(
     leaf_scores: pl.Tensor[[LEAF_DYN, CSA_CANDIDATES_PER_LEAF], pl.FP32],
     leaf_valid_candidates: pl.Tensor[[LEAF_DYN], pl.INT32],
     leaf_logical_begins: pl.Tensor[[LEAF_DYN], pl.INT32],
-    pair_arena: pl.Tensor[[ARENA_DYN, CSA_PAIR_WIDTH], pl.FP32],
+    pair_arena: pl.Tensor[[TOPK_ARENA_ROWS, CSA_PAIR_WIDTH], pl.FP32],
     leaf_id: pl.Scalar[pl.INDEX],
     output_slot: pl.Scalar[pl.INDEX],
-) -> pl.Tensor[[ARENA_DYN, CSA_PAIR_WIDTH], pl.FP32]:
+) -> pl.Tensor[[TOPK_ARENA_ROWS, CSA_PAIR_WIDTH], pl.FP32]:
     valid_candidates = pl.cast(pl.read(leaf_valid_candidates, [leaf_id]), pl.INDEX)
     logical_begin = pl.read(leaf_logical_begins, [leaf_id])
     score_row = leaf_scores[leaf_id : leaf_id + 1, :]
@@ -130,10 +144,10 @@ def score_select_2k_top512(
     idx_windows: pl.Tensor[[REQUEST_DYN, 3], pl.INT32],
     request_epochs: pl.Tensor[[REQUEST_DYN], pl.INT32],
     leaf_descriptors: pl.Tensor[[LEAF_DYN, PHASE_D_LEAF_FIELDS], pl.INT32],
-    pair_arena: pl.Tensor[[ARENA_DYN, CSA_PAIR_WIDTH], pl.FP32],
+    pair_arena: pl.Tensor[[TOPK_ARENA_ROWS, CSA_PAIR_WIDTH], pl.FP32],
     leaf_id: pl.Scalar[pl.INDEX],
     output_slot: pl.Scalar[pl.INDEX],
-) -> pl.Tensor[[ARENA_DYN, CSA_PAIR_WIDTH], pl.FP32]:
+) -> pl.Tensor[[TOPK_ARENA_ROWS, CSA_PAIR_WIDTH], pl.FP32]:
     """Score one ragged 2K leaf and immediately retain its exact Top-512."""
     query = pl.cast(
         pl.read(leaf_descriptors, [leaf_id, PHASE_D_LEAF_QUERY]),
@@ -310,11 +324,11 @@ def score_select_2k_top512(
 
 @pl.jit.incore
 def merge2_top512(
-    pair_arena: pl.Tensor[[ARENA_DYN, CSA_PAIR_WIDTH], pl.FP32],
+    pair_arena: pl.Tensor[[TOPK_ARENA_ROWS, CSA_PAIR_WIDTH], pl.FP32],
     left_slot: pl.Scalar[pl.INDEX],
     right_slot: pl.Scalar[pl.INDEX],
     output_slot: pl.Scalar[pl.INDEX],
-) -> pl.Tensor[[ARENA_DYN, CSA_PAIR_WIDTH], pl.FP32]:
+) -> pl.Tensor[[TOPK_ARENA_ROWS, CSA_PAIR_WIDTH], pl.FP32]:
     merged = pl.mrgsort(
         pair_arena[left_slot : left_slot + 1, :],
         pair_arena[right_slot : right_slot + 1, :],
@@ -344,7 +358,7 @@ def init_topk_roots(
 
 @pl.jit.incore
 def materialize_topk_root(
-    pair_arena: pl.Tensor[[ARENA_DYN, CSA_PAIR_WIDTH], pl.FP32],
+    pair_arena: pl.Tensor[[TOPK_ARENA_ROWS, CSA_PAIR_WIDTH], pl.FP32],
     topk_scores: pl.Tensor[[QUERY_DYN, CSA_TOPK], pl.FP32],
     topk_indices: pl.Tensor[[QUERY_DYN, CSA_TOPK], pl.INT32],
     query: pl.Scalar[pl.INDEX],
@@ -401,7 +415,7 @@ def active_topk_forest(
     upper_output_slots: pl.Tensor[[UPPER_MERGE_DYN], pl.INT32],
     root_slots: pl.Tensor[[QUERY_DYN], pl.INT32],
     root_dependency_slots: pl.Tensor[[QUERY_DYN], pl.INT32],
-    pair_arena: pl.Tensor[[ARENA_DYN, CSA_PAIR_WIDTH], pl.FP32],
+    pair_arena: pl.Tensor[[TOPK_ARENA_ROWS, CSA_PAIR_WIDTH], pl.FP32],
     topk_scores: pl.Tensor[[QUERY_DYN, CSA_TOPK], pl.FP32],
     topk_indices: pl.Tensor[[QUERY_DYN, CSA_TOPK], pl.INT32],
     completion: pl.Array[1, pl.TASK_ID],
@@ -564,7 +578,7 @@ def active_score_topk_forest(
     singleton_descriptors: pl.Tensor[[SINGLETON_DYN, PHASE_D_SINGLETON_FIELDS], pl.INT32],
     upper_descriptors: pl.Tensor[[UPPER_MERGE_DYN, PHASE_D_UPPER_FIELDS], pl.INT32],
     root_descriptors: pl.Tensor[[QUERY_DYN, PHASE_D_ROOT_FIELDS], pl.INT32],
-    pair_arena: pl.Tensor[[ARENA_DYN, CSA_PAIR_WIDTH], pl.FP32],
+    pair_arena: pl.Tensor[[TOPK_ARENA_ROWS, CSA_PAIR_WIDTH], pl.FP32],
     topk_scores: pl.Tensor[[QUERY_DYN, CSA_TOPK], pl.FP32],
     topk_indices: pl.Tensor[[QUERY_DYN, CSA_TOPK], pl.INT32],
     index_commit_dep: pl.Scalar[pl.TASK_ID],
@@ -822,7 +836,7 @@ def packed_forest_test(
     upper_output_slots: pl.Tensor[[UPPER_MERGE_DYN], pl.INT32],
     root_slots: pl.Tensor[[QUERY_DYN], pl.INT32],
     root_dependency_slots: pl.Tensor[[QUERY_DYN], pl.INT32],
-    pair_arena: pl.Tensor[[ARENA_DYN, CSA_PAIR_WIDTH], pl.FP32],
+    pair_arena: pl.Tensor[[TOPK_ARENA_ROWS, CSA_PAIR_WIDTH], pl.FP32],
     topk_scores: pl.Out[pl.Tensor[[QUERY_DYN, CSA_TOPK], pl.FP32]],
     topk_indices: pl.Out[pl.Tensor[[QUERY_DYN, CSA_TOPK], pl.INT32]],
 ):
@@ -843,7 +857,6 @@ def packed_forest_test(
     upper_output_slots.bind_dynamic(0, UPPER_MERGE_DYN)
     root_slots.bind_dynamic(0, QUERY_DYN)
     root_dependency_slots.bind_dynamic(0, QUERY_DYN)
-    pair_arena.bind_dynamic(0, ARENA_DYN)
     topk_scores.bind_dynamic(0, QUERY_DYN)
     topk_indices.bind_dynamic(0, QUERY_DYN)
     completion = pl.array.create(1, pl.TASK_ID)
@@ -890,7 +903,7 @@ def score_select_ragged_test(
     singleton_descriptors: pl.Tensor[[SINGLETON_DYN, PHASE_D_SINGLETON_FIELDS], pl.INT32],
     upper_descriptors: pl.Tensor[[UPPER_MERGE_DYN, PHASE_D_UPPER_FIELDS], pl.INT32],
     root_descriptors: pl.Tensor[[QUERY_DYN, PHASE_D_ROOT_FIELDS], pl.INT32],
-    pair_arena: pl.Tensor[[ARENA_DYN, CSA_PAIR_WIDTH], pl.FP32],
+    pair_arena: pl.Tensor[[TOPK_ARENA_ROWS, CSA_PAIR_WIDTH], pl.FP32],
     topk_scores: pl.Out[pl.Tensor[[QUERY_DYN, CSA_TOPK], pl.FP32]],
     topk_indices: pl.Out[pl.Tensor[[QUERY_DYN, CSA_TOPK], pl.INT32]],
 ):
@@ -909,7 +922,6 @@ def score_select_ragged_test(
     singleton_descriptors.bind_dynamic(0, SINGLETON_DYN)
     upper_descriptors.bind_dynamic(0, UPPER_MERGE_DYN)
     root_descriptors.bind_dynamic(0, QUERY_DYN)
-    pair_arena.bind_dynamic(0, ARENA_DYN)
     topk_scores.bind_dynamic(0, QUERY_DYN)
     topk_indices.bind_dynamic(0, QUERY_DYN)
     index_commit_dep = pl.system.task_dummy(deps=[])

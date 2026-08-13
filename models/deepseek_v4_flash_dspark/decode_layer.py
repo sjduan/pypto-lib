@@ -68,7 +68,6 @@ from decode_compressor_ratio4 import (
     compressor_ratio4,
 )
 from decode_indexer import (
-    ARENA_DYN as CSA_INDEXER_ARENA_DYN,
     B_DYN as CSA_INDEXER_B_DYN,
     IDX_HEAD_DIM,
     IDX_N_HEADS,
@@ -90,6 +89,7 @@ from decode_indexer import (
     indexer,
     phase_d_indexer_test as csa_indexer_stage,
 )
+from decode_indexer_topk import TOPK_ARENA_ROWS
 from decode_indexer_compressor import (
     B_DYN as CSA_INNER_B_DYN,
     COMPRESS_STATE_DIM as CSA_INNER_STATE_DIM,
@@ -203,6 +203,17 @@ assert CSA_CHUNK_T % S == 0
 assert CSA_STATE_POOL_PAGES > CSA_GLOBAL_STATE_HIGH_PAGE
 assert CSA_INNER_STATE_POOL_PAGES > CSA_GLOBAL_STATE_HIGH_PAGE
 
+# The pair arena is a per-chunk scratch with a compile-time capacity.  It is
+# allocated inside ``decode_layer_csa`` with this exact static shape, so the
+# ``decode_layer_csa_chunk`` annotation must use the same static bound rather
+# than a module-scope DynVar: a nested-inline helper that references a DynVar
+# defined outside its own decorated boundary escapes the IR scope after inline
+# expansion and breaks ConvertToSSA.  4080 is only one 16-query chunk's legal
+# forest scratch upper bound; the actual leaf/merge task count is still driven
+# by dynamic descriptor extents.
+CSA_CHUNK_ARENA_ROWS = CSA_CHUNK_T * CSA_MAX_NODES_PER_QUERY
+assert CSA_CHUNK_ARENA_ROWS == 4080
+
 CSA_MAIN_BLOCKS_DYN = pl.dynamic("LAYER_CSA_MAIN_BLOCKS_DYN")
 CSA_IDX_BLOCKS_DYN = pl.dynamic("LAYER_CSA_IDX_BLOCKS_DYN")
 CSA_IDX_ROWS_DYN = pl.dynamic("LAYER_CSA_IDX_ROWS_DYN")
@@ -215,7 +226,9 @@ CSA_LEAF_DYN = pl.dynamic("LAYER_CSA_LEAF_DYN")
 CSA_PAIR_DYN = pl.dynamic("LAYER_CSA_PAIR_DYN")
 CSA_SINGLETON_DYN = pl.dynamic("LAYER_CSA_SINGLETON_DYN")
 CSA_UPPER_DYN = pl.dynamic("LAYER_CSA_UPPER_DYN")
-CSA_ARENA_DYN = pl.dynamic("LAYER_CSA_ARENA_DYN")
+# The per-chunk pair-arena DynVar is intentionally removed: the nested-inline
+# chunk helper must use the static ``CSA_CHUNK_ARENA_ROWS`` bound (see above)
+# so the symbol does not escape its defining scope after inline expansion.
 
 
 def attention_kind_for_layer(layer_id):
@@ -1395,7 +1408,7 @@ def decode_layer_csa_chunk(
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
-    pair_arena: pl.Tensor[[CSA_ARENA_DYN, CSA_PAIR_WIDTH], pl.FP32],
+    pair_arena: pl.Tensor[[CSA_CHUNK_ARENA_ROWS, CSA_PAIR_WIDTH], pl.FP32],
     x_mixed: pl.Tensor[[CSA_CHUNK_T, D], pl.BF16],
     x: pl.Tensor[[CSA_CHUNK_T, D], pl.BF16],
     q: pl.Tensor[[CSA_CHUNK_T, H, HEAD_DIM], pl.BF16],
@@ -1835,7 +1848,7 @@ def decode_layer_csa(
             singleton_rows = pl.tensor.dim(singleton_descriptors, 1)
             upper_rows = pl.tensor.dim(upper_descriptors, 1)
             chunk_pair_arena = pl.create_tensor(
-                [CSA_CHUNK_T * CSA_MAX_NODES_PER_QUERY, CSA_PAIR_WIDTH],
+                [CSA_CHUNK_ARENA_ROWS, CSA_PAIR_WIDTH],
                 dtype=pl.FP32,
             )
             x_mixed = pl.create_tensor([CSA_CHUNK_T, D], dtype=pl.BF16)
@@ -2323,7 +2336,7 @@ def csa_indexer_layer_stage(
         [CSA_INDEXER_T_DYN, PHASE_D_ROOT_FIELDS], pl.INT32
     ],
     pair_arena: pl.InOut[
-        pl.Tensor[[CSA_INDEXER_ARENA_DYN, CSA_PAIR_WIDTH], pl.FP32]
+        pl.Tensor[[TOPK_ARENA_ROWS, CSA_PAIR_WIDTH], pl.FP32]
     ],
     csa_topk_scores_workspace: pl.InOut[
         pl.Tensor[[CSA_INDEXER_T_DYN, CSA_INDEX_TOPK], pl.FP32]

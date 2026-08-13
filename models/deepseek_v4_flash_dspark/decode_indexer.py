@@ -28,7 +28,7 @@ from config import (
     CSA_TOPK_INVALID_TASK_SLOT,
     MAX_CONTEXT_TOKENS,
 )
-from decode_indexer_topk import active_score_topk_forest
+from decode_indexer_topk import TOPK_ARENA_ROWS, active_score_topk_forest
 from decode_metadata import (
     PHASE_D_LEAF_BEGIN,
     PHASE_D_LEAF_FIELDS,
@@ -49,7 +49,11 @@ LEAF_DYN = pl.dynamic("LEAF_DYN")
 PAIR_GROUP_DYN = pl.dynamic("PAIR_GROUP_DYN")
 SINGLETON_DYN = pl.dynamic("SINGLETON_DYN")
 UPPER_MERGE_DYN = pl.dynamic("UPPER_MERGE_DYN")
-ARENA_DYN = pl.dynamic("ARENA_DYN")
+# The pair-arena DynVar is intentionally removed from the ``indexer`` inline ABI:
+# the loop-carried arena escapes its IR scope after inline expansion.  The
+# chunk-wide static bound ``TOPK_ARENA_ROWS`` (imported from
+# ``decode_indexer_topk``) replaces it for both the inline body and this
+# standalone ``@pl.jit`` test wrapper.
 IDX_ROW_DYN = pl.dynamic("IDX_ROW_DYN")
 
 # model config
@@ -134,7 +138,7 @@ def indexer(
         [UPPER_MERGE_DYN, PHASE_D_UPPER_FIELDS], pl.INT32
     ],
     root_descriptors: pl.Tensor[[T_DYN, PHASE_D_ROOT_FIELDS], pl.INT32],
-    pair_arena: pl.Tensor[[ARENA_DYN, CSA_PAIR_WIDTH], pl.FP32],
+    pair_arena: pl.Tensor[[TOPK_ARENA_ROWS, CSA_PAIR_WIDTH], pl.FP32],
     topk_scores: pl.Tensor[[T_DYN, CSA_TOPK], pl.FP32],
     topk_indices: pl.Tensor[[T_DYN, CSA_TOPK], pl.INT32],
     index_commit_dep: pl.Scalar[pl.TASK_ID],
@@ -487,7 +491,7 @@ def phase_d_indexer_test(
         [UPPER_MERGE_DYN, PHASE_D_UPPER_FIELDS], pl.INT32
     ],
     root_descriptors: pl.Tensor[[T_DYN, PHASE_D_ROOT_FIELDS], pl.INT32],
-    pair_arena: pl.Tensor[[ARENA_DYN, CSA_PAIR_WIDTH], pl.FP32],
+    pair_arena: pl.Tensor[[TOPK_ARENA_ROWS, CSA_PAIR_WIDTH], pl.FP32],
     topk_scores: pl.Out[pl.Tensor[[T_DYN, CSA_TOPK], pl.FP32]],
     topk_indices: pl.Out[pl.Tensor[[T_DYN, CSA_TOPK], pl.INT32]],
 ):
@@ -512,7 +516,6 @@ def phase_d_indexer_test(
     singleton_descriptors.bind_dynamic(0, SINGLETON_DYN)
     upper_descriptors.bind_dynamic(0, UPPER_MERGE_DYN)
     root_descriptors.bind_dynamic(0, T_DYN)
-    pair_arena.bind_dynamic(0, ARENA_DYN)
     topk_scores.bind_dynamic(0, T_DYN)
     topk_indices.bind_dynamic(0, T_DYN)
     index_commit_dep = pl.system.task_dummy(deps=[])
