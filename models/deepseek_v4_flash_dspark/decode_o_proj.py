@@ -110,8 +110,10 @@ if DECODE_TOKENS % TP_SIZE != 0:
     raise ValueError(f"decode tokens {DECODE_TOKENS} must be divisible by TP size {TP_SIZE}")
 if O_GROUPS % TP_SIZE != 0:
     raise ValueError(f"output groups {O_GROUPS} must be divisible by TP size {TP_SIZE}")
+if O_GROUP_IN % A_K_TILE != 0:
+    raise ValueError(f"TP1 O-A input {O_GROUP_IN} must be divisible by K tile {A_K_TILE}")
 if O_GROUP_IN % O_A_K_TILE != 0:
-    raise ValueError(f"O-A input {O_GROUP_IN} must be divisible by K tile {O_A_K_TILE}")
+    raise ValueError(f"TP O-A input {O_GROUP_IN} must be divisible by K tile {O_A_K_TILE}")
 if O_LORA % O_A_N_TILE != 0:
     raise ValueError(f"O-A output {O_LORA} must be divisible by N tile {O_A_N_TILE}")
 if O_LORA % O_B_K_TILE != 0:
