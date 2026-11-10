@@ -348,7 +348,9 @@ def dispatch(
     # Scalar metadata stores need whole 64-byte lines per task: RECV_MAX and
     # RECV_TILE are both multiples of 16 FP32/INT32 elements, so an expert row
     # starts on a line and every tile boundary lands on one.
-    gather_tids = pl.array.create(N_LOCAL, pl.TASK_ID)
+    gather_tids = pl.array.create(N_LOCAL + 2, pl.TASK_ID)
+    gather_tids[N_LOCAL] = _wait_tid
+    gather_tids[N_LOCAL + 1] = _meta_tid
     for e in pl.parallel(N_LOCAL):
         gather_tile_tids = pl.array.create(TILES_PER_EXPERT, pl.TASK_ID)
         expert_rows = pl.cast(pl.read(recv_count_out, [e, 0]), pl.INDEX)
@@ -382,7 +384,8 @@ def dispatch(
             gather_tile_tids[tile] = gather_tile_tid
         gather_tids[e] = pl.system.task_dummy(deps=[gather_tile_tids])
 
-    _gather_tid = pl.system.task_dummy(deps=[gather_tids[e] for e in range(N_LOCAL)])
+    # Retain communication completion when every expert has zero receive tiles.
+    _gather_tid = pl.system.task_dummy(deps=[gather_tids])
     return _gather_tid
 
 
@@ -505,7 +508,8 @@ def _moe_tile(
         num_tokens, my_rank, moe_epoch,
     )
 
-    expert_completion_tids = pl.array.create(N_LOCAL, pl.TASK_ID)
+    expert_completion_tids = pl.array.create(N_LOCAL + 1, pl.TASK_ID)
+    expert_completion_tids[N_LOCAL] = dispatch_done
     for local_e in pl.parallel(N_LOCAL):
         tile_completion_tids = pl.array.create(TILES_PER_EXPERT, pl.TASK_ID)
         expert_rows = pl.cast(pl.read(recv_count_out, [local_e, 0]), pl.INDEX)
@@ -550,7 +554,8 @@ def _moe_tile(
         expert_tiles_done = pl.system.task_dummy(deps=[tile_completion_tids])
         expert_completion_tids[local_e] = expert_tiles_done
 
-    scatter_done = pl.system.task_dummy(deps=[expert_completion_tids[local_e] for local_e in range(N_LOCAL)])
+    # Empty owners must complete dispatch before combine and signal clearing.
+    scatter_done = pl.system.task_dummy(deps=[expert_completion_tids])
 
     completion_tid = combine(
         shared_out, ffn_out,
